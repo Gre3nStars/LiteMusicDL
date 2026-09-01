@@ -1,0 +1,26 @@
+[package]
+name = "litemusicdl"
+version = "0.1.0"
+description = "A native multi-source desktop music player and downloader"
+authors = ["LiteMusicDL contributors"]
+edition = "2021"
+
+[lib]
+name = "litemusicdl_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-trait = "0.1"
+futures-util = "0.3"
+lofty = "0.25.1"
+md5 = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["fs", "io-util"] }
+urlencoding = "2"

@@ -1,0 +1,398 @@
+use super::MusicSource;
+use crate::domain::{SourceDescriptor, Track};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const QQ_API: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
+const QQ_STREAM: &str = "https://isure.stream.qqmusic.qq.com/";
+const QQ_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+
+// Exact file type order used by musicdl's QQ `SongFileType`.
+const FILE_TYPES: &[(&str, &str, &str)] = &[
+    ("AI00", ".flac", "臻品母带"),
+    ("Q000", ".flac", "全景声 2.0"),
+    ("Q001", ".flac", "全景声 5.1"),
+    ("F000", ".flac", "无损"),
+    ("O801", ".ogg", "OGG 640K"),
+    ("O800", ".ogg", "OGG 320K"),
+    ("O600", ".ogg", "OGG 192K"),
+    ("O400", ".ogg", "OGG 96K"),
+    ("M800", ".mp3", "MP3 320K"),
+    ("M500", ".mp3", "MP3 128K"),
+    ("C600", ".m4a", "AAC 192K"),
+    ("C400", ".m4a", "AAC 96K"),
+    ("C200", ".m4a", "AAC 48K"),
+];
+
+static GUID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub struct QqSource {
+    client: reqwest::Client,
+}
+
+impl QqSource {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+
+    fn common() -> Value {
+        json!({
+            "ct": "11", "tmeAppID": "qqmusic", "format": "json",
+            "inCharset": "utf-8", "outCharset": "utf-8", "uid": "3931641530",
+            "cv": 13020508, "v": 13020508,
+            // musicdl's documented fallback when QIMEI acquisition is unavailable.
+            "QIMEI36": "6c9d3cd110abca9b16311cee10001e717614"
+        })
+    }
+
+    fn guid() -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        format!(
+            "{:032x}",
+            now ^ GUID_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    async fn legacy_search(&self, query: &str, limit: usize) -> Result<Vec<Value>, String> {
+        let response = self
+            .client
+            .get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp")
+            .query(&[
+                ("format", "json"),
+                ("p", "1"),
+                ("n", &limit.to_string()),
+                ("w", query),
+            ])
+            .header("User-Agent", QQ_UA)
+            .header("Referer", "https://y.qq.com/")
+            .send()
+            .await
+            .map_err(|error| format!("QQ 音乐兼容搜索请求失败: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("QQ 音乐兼容搜索返回错误: {error}"))?;
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("QQ 音乐兼容搜索解析失败: {error}"))?;
+        let mut songs = body
+            .pointer("/data/song/list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // The legacy response keeps album fields flat, while the mobile
+        // response nests them. Normalize only that shape before using the
+        // common QqSong parser.
+        for song in &mut songs {
+            if song.get("album").is_none() {
+                song["album"] = json!({
+                    "title": song.get("albumname").and_then(Value::as_str).unwrap_or_default(),
+                    "mid": song.get("albummid").and_then(Value::as_str).unwrap_or_default(),
+                });
+            }
+        }
+        Ok(songs)
+    }
+
+    async fn resolve_stream(&self, song_mid: &str) -> (String, String, String) {
+        for (prefix, extension, quality) in FILE_TYPES {
+            let filename = format!("{prefix}{song_mid}{song_mid}{extension}");
+            let payload = json!({
+                "comm": Self::common(),
+                "music.vkey.GetVkey.UrlGetVkey": {
+                    "module": "music.vkey.GetVkey", "method": "UrlGetVkey",
+                    "param": {"filename": [filename], "guid": Self::guid(), "songmid": [song_mid], "songtype": [0]}
+                }
+            });
+            let result = self
+                .client
+                .post(QQ_API)
+                .header("User-Agent", QQ_UA)
+                .header("Referer", "https://y.qq.com/")
+                .header("Origin", "https://y.qq.com/")
+                .json(&payload)
+                .send()
+                .await
+                .ok()
+                .and_then(|response| response.error_for_status().ok());
+            let Some(response) = result else { continue };
+            let Ok(value) = response.json::<Value>().await else {
+                continue;
+            };
+            let purl = value
+                .pointer("/music.vkey.GetVkey.UrlGetVkey/data/midurlinfo/0/purl")
+                .or_else(|| {
+                    value.pointer("/music.vkey.GetVkey.UrlGetVkey/data/midurlinfo/0/wifiurl")
+                })
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !purl.is_empty() {
+                let url = if purl.starts_with("http") {
+                    purl.to_owned()
+                } else {
+                    format!("{QQ_STREAM}{purl}")
+                };
+                return (
+                    url,
+                    (*quality).to_owned(),
+                    extension.trim_start_matches('.').to_owned(),
+                );
+            }
+        }
+        self.resolve_tang(song_mid).await
+    }
+
+    // musicdl's `_parsewithtangapi` is part of the original QQ fallback chain.
+    // It is only used if QQ's own VKey response has no playable file.
+    async fn resolve_tang(&self, song_mid: &str) -> (String, String, String) {
+        let value = match self
+            .client
+            .get("https://tang.api.s01s.cn/music_open_api.php")
+            .query(&[("mid", song_mid)])
+            .header("User-Agent", QQ_UA)
+            .send()
+            .await
+        {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response.json::<Value>().await.ok(),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        let Some(value) = value else {
+            return (String::new(), String::new(), String::new());
+        };
+        let candidates = [
+            ("song_play_url_sq", "无损"),
+            ("song_play_url_pq", "高品质"),
+            ("song_play_url_accom", "伴奏"),
+            ("song_play_url_hq", "320K"),
+            ("song_play_url", "128K"),
+            ("song_play_url_standard", "128K"),
+            ("song_play_url_fq", "低品质"),
+        ];
+        for (field, quality) in candidates {
+            let Some(url) = value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|url| url.starts_with("http"))
+            else {
+                continue;
+            };
+            let extension = url
+                .split('?')
+                .next()
+                .and_then(|url| url.rsplit('.').next())
+                .filter(|value| value.len() <= 5)
+                .unwrap_or("m4a");
+            return (url.into(), quality.into(), extension.into());
+        }
+        (String::new(), String::new(), String::new())
+    }
+
+    async fn query_lyric(&self, song_mid: &str) -> Option<String> {
+        let value = self
+            .client
+            .get("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg")
+            .query(&[
+                ("songmid", song_mid),
+                ("g_tk", "5381"),
+                ("loginUin", "0"),
+                ("hostUin", "0"),
+                ("format", "json"),
+                ("inCharset", "utf8"),
+                ("outCharset", "utf-8"),
+                ("platform", "yqq"),
+            ])
+            .header("User-Agent", QQ_UA)
+            .header("Referer", "https://y.qq.com/portal/player.html")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<QqLyricEnvelope>()
+            .await
+            .ok()?;
+        value
+            .lyric
+            .and_then(|encoded| decode_base64(&encoded))
+            .filter(|text| !text.trim().is_empty())
+    }
+
+    fn track_from_song(song: QqSong) -> Track {
+        Track {
+            id: format!("qq:{}", song.mid),
+            source: "QQMusicClient".into(),
+            title: song.title,
+            artist: song
+                .singer
+                .into_iter()
+                .map(|singer| singer.name)
+                .collect::<Vec<_>>()
+                .join(" / "),
+            album: song.album.title,
+            artwork_url: format!(
+                "https://y.gtimg.cn/music/photo_new/T002R800x800M000{}.jpg",
+                song.album.mid
+            ),
+            audio_url: String::new(),
+            duration_ms: song.interval * 1000,
+            format: None,
+            quality: None,
+            adapter_payload: Some(
+                json!({"downloadHeaders": {"Referer": "http://y.qq.com", "User-Agent": QQ_UA}}),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QqSong {
+    #[serde(alias = "songmid")]
+    mid: String,
+    #[serde(alias = "songname")]
+    title: String,
+    #[serde(default)]
+    singer: Vec<QqSinger>,
+    #[serde(default)]
+    album: QqAlbum,
+    #[serde(default, alias = "interval")]
+    interval: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct QqSinger {
+    name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct QqAlbum {
+    #[serde(default, alias = "albumname")]
+    title: String,
+    #[serde(default, alias = "albummid")]
+    mid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct QqLyricEnvelope {
+    lyric: Option<String>,
+}
+
+fn decode_base64(input: &str) -> Option<String> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let values = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+        .map(value)
+        .collect::<Option<Vec<_>>>()?;
+    let mut output = Vec::with_capacity(values.len() * 3 / 4);
+    for chunk in values.chunks(4) {
+        if chunk.len() < 2 {
+            return None;
+        }
+        output.push((chunk[0] << 2) | (chunk[1] >> 4));
+        if chunk.len() > 2 {
+            output.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        if chunk.len() > 3 {
+            output.push((chunk[2] << 6) | chunk[3]);
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+#[async_trait]
+impl MusicSource for QqSource {
+    fn descriptor(&self) -> SourceDescriptor {
+        SourceDescriptor {
+            id: "QQMusicClient",
+            name: "QQ音乐",
+            capabilities: &["search", "stream", "download", "lyrics"],
+            enabled: true,
+        }
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>, String> {
+        let payload = json!({
+            "comm": Self::common(),
+            "music.search.SearchCgiService.DoSearchForQQMusicMobile": {
+                "module": "music.search.SearchCgiService", "method": "DoSearchForQQMusicMobile",
+                "param": {"searchid": Self::guid(), "query": query, "search_type": 0, "num_per_page": limit, "page_num": 1, "highlight": 1, "grp": 1}
+            }
+        });
+        let response = self
+            .client
+            .post(QQ_API)
+            .header("User-Agent", QQ_UA)
+            .header("Referer", "https://y.qq.com/")
+            .header("Origin", "https://y.qq.com/")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| format!("QQ 音乐搜索请求失败: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("QQ 音乐搜索返回错误: {error}"))?;
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("QQ 音乐搜索数据解析失败: {error}"))?;
+        let songs = body
+            .pointer("/music.search.SearchCgiService.DoSearchForQQMusicMobile/data/body/item_song")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let songs = if songs.is_empty() {
+            self.legacy_search(query, limit).await?
+        } else {
+            songs
+        };
+        let parsed = songs
+            .into_iter()
+            .filter_map(|song| serde_json::from_value::<QqSong>(song).ok())
+            .take(limit)
+            .collect::<Vec<_>>();
+        Ok(parsed.into_iter().map(Self::track_from_song).collect())
+    }
+
+    async fn resolve_track(&self, track: &Track) -> Result<Track, String> {
+        if !track.audio_url.trim().is_empty() {
+            return Ok(track.clone());
+        }
+        let song_mid = track
+            .id
+            .strip_prefix("qq:")
+            .ok_or_else(|| "歌曲标识不属于 QQ 音乐".to_string())?;
+        let (audio_url, quality, extension) = self.resolve_stream(song_mid).await;
+        if audio_url.is_empty() {
+            return Err("QQ 音乐未返回可用音频地址".into());
+        }
+        let mut resolved = track.clone();
+        resolved.audio_url = audio_url;
+        resolved.format = Some(extension.to_uppercase());
+        resolved.quality = (!quality.is_empty()).then_some(quality);
+        Ok(resolved)
+    }
+
+    async fn lyrics(&self, track: &Track) -> Result<Option<String>, String> {
+        let song_mid = track
+            .id
+            .strip_prefix("qq:")
+            .ok_or_else(|| "歌曲标识不属于 QQ 音乐".to_string())?;
+        Ok(self.query_lyric(song_mid).await)
+    }
+}
