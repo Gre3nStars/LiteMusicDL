@@ -35,6 +35,12 @@ export async function deleteFile(path: string): Promise<void> {
   return invoke<void>("delete_file", { path });
 }
 
+/** Open the OS file manager at `path` (selecting the item when supported). */
+export async function revealInFolder(path: string): Promise<void> {
+  requireDesktop();
+  return invoke<void>("reveal_in_folder", { path });
+}
+
 export async function resolveQualities(tracks: Track[]): Promise<Track[]> {
   requireDesktop();
   return invoke<Track[]>("resolve_qualities", { tracks });

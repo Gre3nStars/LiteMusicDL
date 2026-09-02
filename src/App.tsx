@@ -34,7 +34,7 @@ import {
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { allSources, defaultSources, getSourceMeta, localSource } from "./data/sources";
-import { cancelDownload, chooseDownloadDirectory, chooseMusicDirectory, deleteFile, downloadTrack, fetchLyrics, loadDownloadHistory, preparePlayback, resolveQualities, saveDownloadHistory, scanLocalMusic, searchTracks } from "./lib/bridge";
+import { cancelDownload, chooseDownloadDirectory, chooseMusicDirectory, deleteFile, downloadTrack, fetchLyrics, loadDownloadHistory, preparePlayback, resolveQualities, revealInFolder, saveDownloadHistory, scanLocalMusic, searchTracks } from "./lib/bridge";
 import type { DownloadItem, Track } from "./types";
 
 type Page = "search" | "discover" | "favorites" | "downloads" | "local" | "history" | "settings";
@@ -133,6 +133,23 @@ function qualityTone(label: string): string {
   return "other";
 }
 
+/** Extract the on-disk path of a scanned local track held in adapterPayload. */
+function localPathOf(track: Track): string | undefined {
+  const value = track.adapterPayload?.localPath;
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/** Return `track` with its `adapterPayload.localPath` set to the on-disk file of
+ * a completed download (matched by track id), so playback serves the local file
+ * rather than re-resolving a possibly-dead upstream URL. */
+function withLocalPath(track: Track, downloads: DownloadItem[]): Track {
+  const done = downloads.find((item) => item.status === "completed" && item.track.id === track.id);
+  if (!done?.path) return track;
+  const path = track.adapterPayload?.localPath;
+  if (typeof path === "string" && path.trim()) return track;
+  return { ...track, adapterPayload: { ...track.adapterPayload, localPath: done.path } };
+}
+
 export default function App() {
   const [lightTheme, setLightTheme] = useState(() => localStorage.getItem("litemusic:theme") === "light");
   const [gradient, setGradient] = useState(() => localStorage.getItem("litemusic:gradient") === "on");
@@ -179,7 +196,6 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const searchTokenRef = useRef(0);
   const lastProgressAtRef = useRef(Date.now());
-  const scannedDirectoryRef = useRef("");
   const localScanTokenRef = useRef(0);
 
   useEffect(() => localStorage.setItem("litemusic:favorites", JSON.stringify(favorites)), [favorites]);
@@ -247,11 +263,6 @@ export default function App() {
       });
     return () => { cancelled = true; };
   }, [currentTrack]);
-  useEffect(() => {
-    if (page !== "local" || !localDirectory || scannedDirectoryRef.current === localDirectory) return;
-    scanLocalLibrary(localDirectory);
-  }, [page, localDirectory]);
-
   const favoriteIds = useMemo(() => new Set(favorites.map((track) => track.id)), [favorites]);
   const visibleTracks = useMemo(() => tracks.filter((track) => selectedSources.includes(track.source)), [selectedSources, tracks]);
   const visibleLocalTracks = useMemo(() => localTracks.filter((track) => !hiddenLocalTrackIds.includes(track.id)), [hiddenLocalTrackIds, localTracks]);
@@ -332,7 +343,6 @@ export default function App() {
     const selectedDirectory = directory.trim();
     if (!selectedDirectory) return;
     const token = ++localScanTokenRef.current;
-    scannedDirectoryRef.current = selectedDirectory;
     setLocalScanning(true);
     setLocalError("");
     try {
@@ -369,9 +379,14 @@ export default function App() {
     setPlaybackError("");
     setPlaybackPending(true);
     setNotice(`正在准备播放「${track.title}」…`);
+    // If this track is already downloaded, serve the on-disk file instead of
+    // resolving a (possibly rate-limited/expired) upstream URL again. This is
+    // what lets a downloaded song keep playing even when the source's stream
+    // address is no longer available.
+    const playTrack = withLocalPath(track, downloads);
     let playable: Track;
     try {
-      playable = await preparePlayback(track);
+      playable = await preparePlayback(playTrack);
     } catch (playError) {
       setPlaybackPending(false);
       const message = `无法准备播放：${String(playError)}`;
@@ -519,6 +534,32 @@ export default function App() {
     setDownloads((items) => items.filter((entry) => entry.id !== id));
   }
 
+  async function revealTrackFile(track: Track) {
+    const path = localPathOf(track);
+    if (!path) {
+      setNotice("无法确定该本地歌曲的文件路径");
+      return;
+    }
+    try {
+      await revealInFolder(path);
+    } catch (revealError) {
+      setNotice(`打开所在文件夹失败：${String(revealError)}`);
+    }
+  }
+
+  async function revealDownloadFile(item: DownloadItem) {
+    const path = item.path;
+    if (!path) {
+      setNotice("该下载没有可定位的本地文件");
+      return;
+    }
+    try {
+      await revealInFolder(path);
+    } catch (revealError) {
+      setNotice(`打开所在文件夹失败：${String(revealError)}`);
+    }
+  }
+
   return (
     <div className={`obsidian-app ${lightTheme ? "light-theme" : ""} ${gradient ? "gradient-bg" : ""}`}>
       <Sidebar page={page} onNavigate={setPage} onToggleTheme={() => setLightTheme((value) => !value)} />
@@ -557,14 +598,14 @@ export default function App() {
           />
         )}
         {page === "favorites" && (
-          <LibraryPage title="收藏" subtitle={`${favorites.length} 首歌曲`} tracks={favorites} empty="把想再听的音乐留在这里。" favoriteIds={favoriteIds} onPlay={play} onFavorite={toggleFavorite} onDownload={startDownload} downloadedIds={downloadedIds} inFlightIds={inFlightIds} onDownloadAll={() => batchDownload(favorites)} />
+          <LibraryPage title="收藏" subtitle={`${favorites.length} 首歌曲`} tracks={favorites} empty="把想再听的音乐留在这里。" favoriteIds={favoriteIds} onPlay={play} onFavorite={toggleFavorite} onDownload={startDownload} downloadedIds={downloadedIds} inFlightIds={inFlightIds} onDownloadAll={() => batchDownload(favorites)} onRevealFile={revealTrackFile} />
         )}
-        {page === "downloads" && <DownloadsPage items={downloads} onStop={stopDownload} onRemove={removeDownload} onDeleteFile={deleteDownloadFile} />}
+        {page === "downloads" && <DownloadsPage items={downloads} onStop={stopDownload} onRemove={removeDownload} onDeleteFile={deleteDownloadFile} onReveal={revealDownloadFile} onPlay={play} />}
         {page === "discover" && (
           <LibraryPage title="发现" subtitle="仅展示音源实时返回的音乐" tracks={tracks} empty="搜索后，真实结果会出现在这里。" favoriteIds={favoriteIds} onPlay={play} onFavorite={toggleFavorite} onDownload={startDownload} downloadedIds={downloadedIds} inFlightIds={inFlightIds} onDownloadAll={() => batchDownload(tracks)} />
         )}
-        {page === "local" && <LocalMusicPage tracks={shownLocalTracks} directory={localDirectory} scanning={localScanning} error={localError} hiddenCount={hiddenLocalTrackIds.length} favoriteIds={favoriteIds} currentTrackId={currentTrack?.id ?? ""} onChooseDirectory={selectLocalDirectory} onRescan={() => scanLocalLibrary()} onRestoreHidden={() => setHiddenLocalTrackIds([])} onRemoveFromLibrary={hideLocalTrack} onPlay={play} onFavorite={toggleFavorite} onDownload={startDownload} downloadedIds={downloadedIds} inFlightIds={inFlightIds} query={localQuery} onQueryChange={setLocalQuery} />}
-        {page === "history" && <LibraryPage title="最近播放" subtitle="继续刚才的声音" tracks={history} empty="还没有播放记录。" favoriteIds={favoriteIds} onPlay={play} onFavorite={toggleFavorite} onDownload={startDownload} downloadedIds={downloadedIds} inFlightIds={inFlightIds} onDownloadAll={() => batchDownload(history)} />}
+        {page === "local" && <LocalMusicPage tracks={shownLocalTracks} directory={localDirectory} scanning={localScanning} error={localError} hiddenCount={hiddenLocalTrackIds.length} favoriteIds={favoriteIds} currentTrackId={currentTrack?.id ?? ""} onChooseDirectory={selectLocalDirectory} onRescan={() => scanLocalLibrary()} onRestoreHidden={() => setHiddenLocalTrackIds([])} onRemoveFromLibrary={hideLocalTrack} onRevealFile={revealTrackFile} onPlay={play} onFavorite={toggleFavorite} onDownload={startDownload} downloadedIds={downloadedIds} inFlightIds={inFlightIds} query={localQuery} onQueryChange={setLocalQuery} />}
+        {page === "history" && <LibraryPage title="最近播放" subtitle="继续刚才的声音" tracks={history} empty="还没有播放记录。" favoriteIds={favoriteIds} onPlay={play} onFavorite={toggleFavorite} onDownload={startDownload} downloadedIds={downloadedIds} inFlightIds={inFlightIds} onDownloadAll={() => batchDownload(history)} onRevealFile={revealTrackFile} />}
         {page === "settings" && (
           <SettingsPage
             defaultDownloadPath={defaultDownloadPath}
@@ -719,10 +760,11 @@ function TrackListHeader() {
   return <div className="track-table-header"><span>#</span><span>歌曲</span><span>歌手</span><span>专辑</span><span>来源</span><span>音质</span><span>时长</span><span /></div>;
 }
 
-function TrackRow({ track, index, active, favorite, onPlay, onFavorite, onDownload, showRemoveFavorite = false, allowDownload = true, onRemoveFromLibrary, downloadedIds, inFlightIds }: { track: Track; index: number; active: boolean; favorite: boolean; showRemoveFavorite?: boolean; allowDownload?: boolean; onRemoveFromLibrary?: (track: Track) => void; downloadedIds?: Set<string>; inFlightIds?: Set<string> } & Omit<TrackActions, "favoriteIds">) {
+function TrackRow({ track, index, active, favorite, onPlay, onFavorite, onDownload, showRemoveFavorite = false, allowDownload = true, onRemoveFromLibrary, onRevealFile, downloadedIds, inFlightIds }: { track: Track; index: number; active: boolean; favorite: boolean; showRemoveFavorite?: boolean; allowDownload?: boolean; onRemoveFromLibrary?: (track: Track) => void; onRevealFile?: (track: Track) => void; downloadedIds?: Set<string>; inFlightIds?: Set<string> } & Omit<TrackActions, "favoriteIds">) {
   const source = getSourceMeta(track.source);
   const isDownloaded = downloadedIds?.has(track.id) ?? false;
   const isDownloading = inFlightIds?.has(track.id) ?? false;
+  const revealPath = onRevealFile ? localPathOf(track) : undefined;
   return (
     <div className={`track-row ${active ? "playing" : ""}`}>
       <button className="row-play" title={active ? "正在播放" : "播放"} onClick={() => onPlay(track)}>{active ? <span className="eq" aria-hidden="true"><i /><i /><i /></span> : <><span>{String(index + 1).padStart(2, "0")}</span><Play size={14} fill="currentColor" /></>}</button>
@@ -734,6 +776,7 @@ function TrackRow({ track, index, active, favorite, onPlay, onFavorite, onDownlo
       <span className="duration-cell">{track.durationMs > 0 ? formatTime(track.durationMs / 1000) : "—"}</span>
       <span className="track-actions">
         {onRemoveFromLibrary && <button className="remove-favorite" onClick={() => onRemoveFromLibrary(track)} aria-label="从资料库移除" title="从资料库移除（不会删除本地文件）"><X size={16} /></button>}
+        {revealPath && onRevealFile && <button className="reveal-file" onClick={() => onRevealFile(track)} aria-label="打开所在文件夹" title="打开所在文件夹"><FolderOpen size={16} /></button>}
         {showRemoveFavorite
           ? <button className="remove-favorite" onClick={() => onFavorite(track)} aria-label="移除收藏" title="移除收藏"><X size={16} /></button>
           : <button className={favorite ? "favorite" : ""} onClick={() => onFavorite(track)} aria-label={favorite ? "取消收藏" : "收藏"} title={favorite ? "取消收藏" : "收藏"}><Heart size={17} fill={favorite ? "currentColor" : "none"} /></button>}
@@ -781,7 +824,7 @@ function PlayerBar({ track, isPlaying, favorite, elapsed, duration, volume, onTo
   );
 }
 
-function LibraryPage({ title, subtitle, tracks, empty, favoriteIds, onPlay, onFavorite, onDownload, downloadedIds, inFlightIds, onDownloadAll }: TrackActions & { title: string; subtitle: string; tracks: Track[]; empty: string; downloadedIds?: Set<string>; inFlightIds?: Set<string>; onDownloadAll?: (tracks: Track[]) => void }) {
+function LibraryPage({ title, subtitle, tracks, empty, favoriteIds, onPlay, onFavorite, onDownload, downloadedIds, inFlightIds, onDownloadAll, onRevealFile }: TrackActions & { title: string; subtitle: string; tracks: Track[]; empty: string; downloadedIds?: Set<string>; inFlightIds?: Set<string>; onDownloadAll?: (tracks: Track[]) => void; onRevealFile?: (track: Track) => void }) {
   const isFavorites = title === "收藏";
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
@@ -791,10 +834,10 @@ function LibraryPage({ title, subtitle, tracks, empty, favoriteIds, onPlay, onFa
         || track.artist.toLowerCase().includes(q)
         || track.album.toLowerCase().includes(q))
     : tracks;
-  return <section className="library-page"><div className="library-title"><span><Library size={19} /></span><div><h1>{title}</h1><p>{subtitle}</p></div><div className="library-actions">{tracks.length > 0 && onDownloadAll && <button className="secondary" onClick={() => onDownloadAll(tracks)}><Download size={16} /> 下载全部{downloadedIds?.size ? `（${tracks.filter((t) => downloadedIds.has(t.id)).length} 已下载）` : ""}</button>}{tracks.length > 0 && <button onClick={() => onPlay(shownTracks[0])}><Play size={18} fill="currentColor" /> 播放全部</button>}</div></div>{tracks.length > 0 && <div className="local-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索${title}（标题 / 歌手 / 专辑）`} aria-label={`搜索${title}`} />{query && <button className="local-search-clear" onClick={() => setQuery("")} aria-label="清空搜索"><X size={14} /></button>}</div>}{shownTracks.length ? <div className="library-list"><TrackListHeader />{shownTracks.map((track, index) => <TrackRow key={track.id} track={track} index={index} active={false} favorite={favoriteIds.has(track.id)} onPlay={onPlay} onFavorite={onFavorite} onDownload={onDownload} showRemoveFavorite={isFavorites} downloadedIds={downloadedIds} inFlightIds={inFlightIds} />)}</div> : <div className="center-state library-empty"><Album size={30} /><strong>{tracks.length ? (q ? "没有匹配的歌曲" : empty) : empty}</strong></div>}</section>;
+  return <section className="library-page"><div className="library-title"><span><Library size={19} /></span><div><h1>{title}</h1><p>{subtitle}</p></div><div className="library-actions">{tracks.length > 0 && onDownloadAll && <button className="secondary" onClick={() => onDownloadAll(tracks)}><Download size={16} /> 下载全部{downloadedIds?.size ? `（${tracks.filter((t) => downloadedIds.has(t.id)).length} 已下载）` : ""}</button>}{tracks.length > 0 && <button onClick={() => onPlay(shownTracks[0])}><Play size={18} fill="currentColor" /> 播放全部</button>}</div></div>{tracks.length > 0 && <div className="local-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`搜索${title}（标题 / 歌手 / 专辑）`} aria-label={`搜索${title}`} />{query && <button className="local-search-clear" onClick={() => setQuery("")} aria-label="清空搜索"><X size={14} /></button>}</div>}{shownTracks.length ? <div className="library-list"><TrackListHeader />{shownTracks.map((track, index) => <TrackRow key={track.id} track={track} index={index} active={false} favorite={favoriteIds.has(track.id)} onPlay={onPlay} onFavorite={onFavorite} onDownload={onDownload} showRemoveFavorite={isFavorites} onRevealFile={onRevealFile} downloadedIds={downloadedIds} inFlightIds={inFlightIds} />)}</div> : <div className="center-state library-empty"><Album size={30} /><strong>{tracks.length ? (q ? "没有匹配的歌曲" : empty) : empty}</strong></div>}</section>;
 }
 
-function LocalMusicPage({ tracks, directory, scanning, error, hiddenCount, favoriteIds, currentTrackId, onChooseDirectory, onRescan, onRestoreHidden, onRemoveFromLibrary, onPlay, onFavorite, onDownload, downloadedIds, inFlightIds, query, onQueryChange }: TrackActions & {
+function LocalMusicPage({ tracks, directory, scanning, error, hiddenCount, favoriteIds, currentTrackId, onChooseDirectory, onRescan, onRestoreHidden, onRemoveFromLibrary, onRevealFile, onPlay, onFavorite, onDownload, downloadedIds, inFlightIds, query, onQueryChange }: TrackActions & {
   tracks: Track[];
   directory: string;
   scanning: boolean;
@@ -805,6 +848,7 @@ function LocalMusicPage({ tracks, directory, scanning, error, hiddenCount, favor
   onRescan: () => void;
   onRestoreHidden: () => void;
   onRemoveFromLibrary: (track: Track) => void;
+  onRevealFile: (track: Track) => void;
   downloadedIds?: Set<string>;
   inFlightIds?: Set<string>;
   query: string;
@@ -824,12 +868,12 @@ function LocalMusicPage({ tracks, directory, scanning, error, hiddenCount, favor
     {error && <div className="local-scan-error" role="alert">{error}</div>}
     {directory && <div className="local-search"><Search size={15} /><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索本地音乐（标题 / 歌手 / 专辑）" aria-label="搜索本地音乐" />{query && <button className="local-search-clear" onClick={() => onQueryChange("")} aria-label="清空搜索"><X size={14} /></button>}</div>}
     {scanning && !tracks.length ? <div className="center-state library-empty"><LoaderCircle className="spin" size={30} /><strong>正在扫描本地音乐</strong></div>
-      : tracks.length ? <div className="library-list"><TrackListHeader />{tracks.map((track, index) => <TrackRow key={track.id} track={track} index={index} active={currentTrackId === track.id} favorite={favoriteIds.has(track.id)} onPlay={onPlay} onFavorite={onFavorite} onDownload={onDownload} allowDownload={false} onRemoveFromLibrary={onRemoveFromLibrary} downloadedIds={downloadedIds} inFlightIds={inFlightIds} />)}</div>
-        : <div className="center-state library-empty"><FolderOpen size={30} /><strong>{directory ? (query ? "没有匹配的本地音乐" : "没有找到支持的音频文件") : "选择音乐文件夹开始扫描"}</strong></div>}
+      : tracks.length ? <div className="library-list"><TrackListHeader />{tracks.map((track, index) => <TrackRow key={track.id} track={track} index={index} active={currentTrackId === track.id} favorite={favoriteIds.has(track.id)} onPlay={onPlay} onFavorite={onFavorite} onDownload={onDownload} allowDownload={false} onRemoveFromLibrary={onRemoveFromLibrary} onRevealFile={onRevealFile} downloadedIds={downloadedIds} inFlightIds={inFlightIds} />)}</div>
+        : <div className="center-state library-empty"><FolderOpen size={30} /><strong>{directory ? (query ? "没有匹配的本地音乐" : "点击「重新扫描」开始扫描本地音乐") : "选择音乐文件夹开始扫描"}</strong></div>}
   </section>;
 }
 
-function DownloadsPage({ items, onStop, onRemove, onDeleteFile }: { items: DownloadItem[]; onStop: (id: string) => void; onRemove: (id: string) => void; onDeleteFile: (id: string) => void }) {
+function DownloadsPage({ items, onStop, onRemove, onDeleteFile, onReveal, onPlay }: { items: DownloadItem[]; onStop: (id: string) => void; onRemove: (id: string) => void; onDeleteFile: (id: string) => void; onReveal: (item: DownloadItem) => void; onPlay: (track: Track) => void }) {
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
   const shownItems = q ? items.filter((item) =>
@@ -837,7 +881,7 @@ function DownloadsPage({ items, onStop, onRemove, onDeleteFile }: { items: Downl
     || item.track.artist.toLowerCase().includes(q)
     || item.track.album.toLowerCase().includes(q)
     || (item.path || "").toLowerCase().includes(q)) : items;
-  return <section className="downloads-page"><div className="library-title"><span><Download size={19} /></span><div><h1>下载管理</h1><p>{items.filter((item) => item.status === "completed").length} 个任务已完成 · 有歌词时自动保存同名 LRC</p></div></div>{items.length > 0 && <div className="local-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索下载（标题 / 歌手 / 专辑 / 路径）" aria-label="搜索下载" />{query && <button className="local-search-clear" onClick={() => setQuery("")} aria-label="清空搜索"><X size={14} /></button>}</div>}{!items.length ? <div className="center-state library-empty"><Download size={30} /><strong>还没有下载任务</strong><small>在歌曲右侧点击下载按钮并选择保存目录</small></div> : shownItems.length ? <div className="download-list">{shownItems.map((item) => <div className="download-row" key={item.id}><Artwork track={item.track} /><span><strong>{item.track.title}</strong><small>{item.track.artist} · {item.track.format}</small></span><div><i><em style={{ width: `${item.progress}%` }} /></i><small>{item.status === "completed" ? item.path : item.status === "failed" ? item.error : "正在下载音频与可用歌词"}</small></div><span className={`download-status ${item.status}`}>{item.status === "completed" ? <Check size={15} /> : item.status === "failed" ? <X size={15} /> : `${item.progress}%`}</span><span className="download-actions">{item.status === "downloading" && <button onClick={() => onStop(item.id)} title="停止下载" aria-label="停止下载"><Pause size={14} fill="currentColor" /></button>}{item.path && <button onClick={() => onDeleteFile(item.id)} title="删除本地文件（含 LRC）" aria-label="删除本地文件"><Trash2 size={15} /></button>}<button onClick={() => onRemove(item.id)} title="删除记录" aria-label="删除记录"><X size={15} /></button></span></div>)}</div> : <div className="center-state library-empty"><Download size={30} /><strong>没有匹配的下载</strong></div>}</section>;
+  return <section className="downloads-page"><div className="library-title"><span><Download size={19} /></span><div><h1>下载管理</h1><p>{items.filter((item) => item.status === "completed").length} 个任务已完成 · 有歌词时自动保存同名 LRC</p></div></div>{items.length > 0 && <div className="local-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索下载（标题 / 歌手 / 专辑 / 路径）" aria-label="搜索下载" />{query && <button className="local-search-clear" onClick={() => setQuery("")} aria-label="清空搜索"><X size={14} /></button>}</div>}{!items.length ? <div className="center-state library-empty"><Download size={30} /><strong>还没有下载任务</strong><small>在歌曲右侧点击下载按钮并选择保存目录</small></div> : shownItems.length ? <div className="download-list">{shownItems.map((item) => <div className="download-row" key={item.id}><Artwork track={item.track} /><span><strong>{item.track.title}</strong><small>{item.track.artist} · {item.track.format}</small></span><div><i><em style={{ width: `${item.progress}%` }} /></i><small>{item.status === "completed" ? item.path : item.status === "failed" ? item.error : "正在下载音频与可用歌词"}</small></div><span className={`download-status ${item.status}`}>{item.status === "completed" ? <Check size={15} /> : item.status === "failed" ? <X size={15} /> : `${item.progress}%`}</span><span className="download-actions">{item.status === "completed" && <button onClick={() => onPlay(item.track)} title="播放" aria-label="播放"><Play size={14} fill="currentColor" /></button>}{item.status === "downloading" && <button onClick={() => onStop(item.id)} title="停止下载" aria-label="停止下载"><Pause size={14} fill="currentColor" /></button>}{item.path && <button onClick={() => onReveal(item)} title="打开所在文件夹" aria-label="打开所在文件夹"><FolderOpen size={14} /></button>}{item.path && <button onClick={() => onDeleteFile(item.id)} title="删除本地文件（含 LRC）" aria-label="删除本地文件"><Trash2 size={15} /></button>}<button onClick={() => onRemove(item.id)} title="删除记录" aria-label="删除记录"><X size={15} /></button></span></div>)}</div> : <div className="center-state library-empty"><Download size={30} /><strong>没有匹配的下载</strong></div>}</section>;
 }
 
 function SettingsPage({ defaultDownloadPath, onChangeDownloadPath, gradient, onToggleGradient }: {

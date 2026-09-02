@@ -1023,6 +1023,67 @@ async fn delete_file(path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Open the OS file manager at the given file/folder, selecting the item when
+/// the platform supports it (Finder / Explorer). Used by the "打开所在文件夹"
+/// action on downloads and local-music rows.
+#[tauri::command]
+async fn reveal_in_folder(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path.trim());
+    if !path.exists() {
+        return Err("文件不存在".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || reveal_in_folder_os(&path))
+        .await
+        .map_err(|error| format!("打开所在文件夹任务中断: {error}"))?
+}
+
+fn reveal_in_folder_os(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|error| format!("无法在访达中定位文件: {error}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if path.is_dir() {
+            std::process::Command::new("explorer.exe")
+                .arg(path)
+                .spawn()
+                .map_err(|error| format!("无法在资源管理器中打开目录: {error}"))?;
+        } else {
+            std::process::Command::new("explorer.exe")
+                .arg(format!("/select,{}", path.display()))
+                .spawn()
+                .map_err(|error| format!("无法在资源管理器中定位文件: {error}"))?;
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let target = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .map(|parent| parent.to_path_buf())
+                .ok_or_else(|| "无法确定所在文件夹".to_string())?
+        };
+        std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()
+            .map_err(|error| format!("无法打开所在文件夹: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = path;
+        Err("当前平台不支持打开所在文件夹".into())
+    }
+}
+
 #[tauri::command]
 async fn get_lyrics(state: State<'_, AppState>, track: Track) -> Result<Option<String>, String> {
     if let Some(path) = local_path(&track) {
@@ -1215,6 +1276,7 @@ pub fn run() {
             download_track,
             cancel_download,
             delete_file,
+            reveal_in_folder,
             get_lyrics,
             load_download_history,
             save_download_history,
