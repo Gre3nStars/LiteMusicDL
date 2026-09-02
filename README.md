@@ -1,6 +1,6 @@
 # LiteMusicDL
 
-LiteMusicDL 是一个使用 React、TypeScript、Rust 与 Tauri 2 完全重写的桌面音乐播放器和下载管理器。运行时不依赖原 musicdl 项目的 Python 代码；音源以 Rust `MusicSource` 适配器接入。
+LiteMusicDL 是一个使用 React、TypeScript、Rust 与 Tauri 2 完全重写的桌面音乐播放器和下载管理器；音源以 Rust `MusicSource` 适配器接入。
 
 ## 已实现
 
@@ -22,7 +22,7 @@ LiteMusicDL 是一个使用 React、TypeScript、Rust 与 Tauri 2 完全重写�
 | 网易云音乐 | 否 | 已接入 | 已接入 | 已接入 |
 | 咪咕音乐 | 否 | 已接入 | 已接入 | 已接入 |
 
-这些音源均来自原 musicdl 项目的适配范围。项目不会使用演示歌曲或伪造歌词填充界面。
+这些音源均来自原开源项目 musicdl 。
 
 ## 界面
 <img width="3596" height="2102" alt="image" src="https://github.com/user-attachments/assets/51a3ad80-52f7-4dea-8e08-94829c917994" />
@@ -65,6 +65,6 @@ cargo check
 - `src-tauri/src/download.rs`：流式下载与安全文件名处理
 - `src-tauri/src/lib.rs`：Tauri 命令、并行音源搜索和歌词写入
 
-## 使用边界
+## 使用
 
 仅用于个人学习和合法获取的内容。付费、订阅、地区限制或其他受保护内容需要用户通过对应平台取得授权；LiteMusicDL 不绕过 DRM、付费墙或访问控制。
