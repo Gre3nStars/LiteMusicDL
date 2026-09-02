@@ -505,7 +505,10 @@ fn requested_local_range(
 /// `None` when the header is absent/malformed. Open-ended ranges (`bytes=start-`)
 /// are clamped to a generous window so we don't download the whole file.
 fn requested_range(range: Option<&tauri::http::HeaderValue>) -> Option<(usize, usize)> {
-    const WINDOW: usize = 65_536;
+    // A larger window means far fewer sequential range round-trips, which avoids
+    // mid-stream failures on slow/flaky upstreams while still returning the first
+    // bytes quickly enough to start playback.
+    const WINDOW: usize = 262_144;
     let raw = range.and_then(|value| value.to_str().ok())?;
     let raw = raw.trim().strip_prefix("bytes=")?;
     let (start, end) = raw.split(',').next()?.split_once('-')?;
@@ -664,16 +667,17 @@ async fn stream_track(
             };
         }
         status = 206;
-        // Report the real total so the media element can seek and report duration;
-        // prefer the upstream Content-Length, then its Content-Range total.
-        let total = source_total
-            .or_else(|| {
-                headers
-                    .get(reqwest::header::CONTENT_RANGE)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.rsplit('/').next())
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-            })
+        // Report the real total so the media element can seek and report duration.
+        // For a 206 the authoritative total lives in the Content-Range header
+        // (Content-Length is only the ranged body length); for a 200 the whole
+        // body is returned so Content-Length is the full size.
+        let content_range_total = headers
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit('/').next())
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        let total = content_range_total
+            .or(if is_partial { None } else { source_total })
             .unwrap_or_else(|| start + body.len());
         // Describe the bytes actually served (the file may be shorter than the
         // requested window), so the media element never sees an oversized range.
@@ -855,7 +859,7 @@ async fn write_http_response_ext(
         _ => "OK",
     };
     let mut response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n",
         body.len()
     );
     if let Some(cr) = content_range {
