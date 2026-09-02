@@ -4,28 +4,14 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const QQ_API: &str = "https://u.y.qq.com/cgi-bin/musicu.fcg";
 const QQ_STREAM: &str = "https://isure.stream.qqmusic.qq.com/";
 const QQ_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
-
-// Exact file type order used by musicdl's QQ `SongFileType`.
-const FILE_TYPES: &[(&str, &str, &str)] = &[
-    ("AI00", ".flac", "臻品母带"),
-    ("Q000", ".flac", "全景声 2.0"),
-    ("Q001", ".flac", "全景声 5.1"),
-    ("F000", ".flac", "无损"),
-    ("O801", ".ogg", "OGG 640K"),
-    ("O800", ".ogg", "OGG 320K"),
-    ("O600", ".ogg", "OGG 192K"),
-    ("O400", ".ogg", "OGG 96K"),
-    ("M800", ".mp3", "MP3 320K"),
-    ("M500", ".mp3", "MP3 128K"),
-    ("C600", ".m4a", "AAC 192K"),
-    ("C400", ".m4a", "AAC 96K"),
-    ("C200", ".m4a", "AAC 48K"),
-];
+const QQ_REFERER: &str = "https://y.qq.com/";
+const QQ_SOURCE: &str = "QQMusicClient";
 
 static GUID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -70,7 +56,7 @@ impl QqSource {
                 ("w", query),
             ])
             .header("User-Agent", QQ_UA)
-            .header("Referer", "https://y.qq.com/")
+            .header("Referer", QQ_REFERER)
             .send()
             .await
             .map_err(|error| format!("QQ 音乐兼容搜索请求失败: {error}"))?
@@ -99,8 +85,135 @@ impl QqSource {
         Ok(songs)
     }
 
+    /// Full resolution entry point. musicdl's QQ `_parsewiththirdpartapis` tries a
+    /// *list* of third-party parsers so a single rate-limited/blocked host does
+    /// not fail playback. All resolvers run concurrently so a slow/hung endpoint
+    /// never blocks the fast ones; candidates are ranked by quality, then each is
+    /// probed for a real audio container before being accepted (also filtering out
+    /// dead/mislabeled URLs that surface as MEDIA_ERR_SRC_NOT_SUPPORTED, error 4).
     async fn resolve_stream(&self, song_mid: &str) -> (String, String, String) {
-        for (prefix, extension, quality) in FILE_TYPES {
+        use futures_util::future::{join_all, BoxFuture};
+        let resolvers: Vec<BoxFuture<'_, Option<(String, String, String)>>> = vec![
+            Box::pin(self.resolve_vkey(song_mid)),
+            Box::pin(self.resolve_tang(song_mid)),
+            Box::pin(self.resolve_hk0cc(song_mid)),
+            Box::pin(self.resolve_lzmhhh(song_mid)),
+            Box::pin(self.resolve_yutangxiaowu(song_mid)),
+        ];
+        let mut results = join_all(resolvers)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        // Playback reliability first: a universally-decodable MP3/M4A beats a
+        // lossless FLAC, because WebView2 (Windows) rejects FLAC served through a
+        // custom scheme far more often than it rejects MP3. Within a codec family,
+        // higher quality wins.
+        results.sort_by(|a, b| {
+            stream_preference(&b.2, &b.1)
+                .cmp(&stream_preference(&a.2, &a.1))
+                .then_with(|| quality_rank(&b.1).cmp(&quality_rank(&a.1)))
+        });
+        for (url, quality, extension) in results {
+            if !url.is_empty() && self.streamable(&url, &extension).await {
+                return (url, quality, extension);
+            }
+        }
+        (String::new(), String::new(), String::new())
+    }
+
+    /// Soundness check: confirm the URL serves a real audio container, not an
+    /// HTML/JSON error page or a dead link. This is what prevents the WebView
+    /// from reporting MEDIA_ERR_SRC_NOT_SUPPORTED (error 4) when a resolver hands
+    /// back a "successful" but non-audio URL. Fast path: a recognised audio
+    /// Content-Type (206) is accepted without buffering; only the known-mislabel
+    /// `audio/x-ogg` case reads the leading bytes to trust the real container.
+    async fn streamable(&self, url: &str, extension: &str) -> bool {
+        let response = match self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(5))
+            .header("User-Agent", QQ_UA)
+            .header("Referer", "http://y.qq.com")
+            .header("Range", "bytes=0-2047")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return false,
+        };
+        let status = response.status();
+        if !(status.is_success() || status.as_u16() == 206) {
+            return false;
+        }
+        let kind = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // An HTML/JSON error page is never audio.
+        if kind.contains("text/html")
+            || kind.contains("application/json")
+            || kind.contains("text/plain")
+        {
+            return false;
+        }
+        // Fast path: a real audio type is accepted without reading the body.
+        let base_type = kind.split(';').next().unwrap_or_default();
+        if matches!(
+            base_type,
+            "audio/mpeg" | "audio/mp4" | "audio/aac" | "audio/ogg" | "audio/flac"
+        ) {
+            return true;
+        }
+        // `audio/x-ogg` is how QQ serves genuine FLAC bytes (verified: fLaC magic
+        // with an audio/x-ogg header). Re-label by the container, else reject so the
+        // caller falls through to a reliable MP3/M4A resolver instead of error 4.
+        if base_type == "audio/x-ogg" {
+            if let Ok(bytes) = response.bytes().await {
+                let sample = &bytes[..bytes.len().min(64)];
+                let ext = extension.to_ascii_lowercase();
+                let is_flac = sample.starts_with(b"fLaC");
+                let is_ogg = sample.starts_with(b"OggS");
+                if is_flac && ext != "ogg" {
+                    return true;
+                }
+                return is_ogg;
+            }
+            return false;
+        }
+        // Unknown header: trust the container magic if present.
+        if let Ok(bytes) = response.bytes().await {
+            let sample = &bytes[..bytes.len().min(64)];
+            let ext = extension.to_ascii_lowercase();
+            let magic_ok = if ext == "flac" {
+                sample.starts_with(b"fLaC")
+            } else if ext == "mp3" {
+                sample.starts_with(b"ID3")
+                    || (sample[0] == 0xff && sample.get(1).is_some_and(|b| b & 0xe0 == 0xe0))
+            } else if ext == "m4a" {
+                sample.get(4..8) == Some(b"ftyp")
+            } else {
+                false
+            };
+            return magic_ok;
+        }
+        false
+    }
+
+    /// Official `music.vkey.GetVkey.UrlGetVkey` path (musicdl `_parsewithofficialapiv1`).
+    /// Only the realistic guest tiers are probed (lossless/mp3/aac); the VIP-only
+    /// "臻品" and "全景声" tiers never yield a purl for an anonymous request, and
+    /// skipping them keeps this path from undercutting the faster fallbacks.
+    async fn resolve_vkey(&self, song_mid: &str) -> Option<(String, String, String)> {
+        const GUEST_TYPES: &[(&str, &str, &str)] = &[
+            ("F000", ".flac", "无损"),
+            ("M800", ".mp3", "MP3 320K"),
+            ("M500", ".mp3", "MP3 128K"),
+            ("C600", ".m4a", "AAC 192K"),
+        ];
+        for (prefix, extension, quality) in GUEST_TYPES {
             let filename = format!("{prefix}{song_mid}{song_mid}{extension}");
             let payload = json!({
                 "comm": Self::common(),
@@ -112,9 +225,10 @@ impl QqSource {
             let result = self
                 .client
                 .post(QQ_API)
+                .timeout(Duration::from_secs(4))
                 .header("User-Agent", QQ_UA)
-                .header("Referer", "https://y.qq.com/")
-                .header("Origin", "https://y.qq.com/")
+                .header("Referer", QQ_REFERER)
+                .header("Origin", QQ_REFERER.trim_end_matches('/'))
                 .json(&payload)
                 .send()
                 .await
@@ -137,36 +251,44 @@ impl QqSource {
                 } else {
                     format!("{QQ_STREAM}{purl}")
                 };
-                return (
+                return Some((
                     url,
                     (*quality).to_owned(),
                     extension.trim_start_matches('.').to_owned(),
-                );
+                ));
             }
         }
-        self.resolve_tang(song_mid).await
+        None
     }
 
-    // musicdl's `_parsewithtangapi` is part of the original QQ fallback chain.
-    // It is only used if QQ's own VKey response has no playable file.
-    async fn resolve_tang(&self, song_mid: &str) -> (String, String, String) {
-        let value = match self
+    // musicdl's `_parsewithtangapi` — shared shape with hk0cc (same backend).
+    async fn resolve_tang(&self, song_mid: &str) -> Option<(String, String, String)> {
+        self.tanglike("https://tang.api.s01s.cn/music_open_api.php", song_mid).await
+    }
+
+    // musicdl's `_parsewithhk0ccapi` — an independent host with the same shape.
+    async fn resolve_hk0cc(&self, song_mid: &str) -> Option<(String, String, String)> {
+        self.tanglike("https://api.hk0.cc/api/qqmusic", song_mid).await
+    }
+
+    /// Shared parser for the tang/hk0cc family, which return `song_play_url_{sq,hq,...}`.
+    /// Order: lossless -> high -> standard so a lossless-capable song plays as 无损.
+    async fn tanglike(&self, base: &str, song_mid: &str) -> Option<(String, String, String)> {
+        let value = self
             .client
-            .get("https://tang.api.s01s.cn/music_open_api.php")
+            .get(base)
+            .timeout(Duration::from_secs(8))
             .query(&[("mid", song_mid)])
             .header("User-Agent", QQ_UA)
+            .header("Referer", QQ_REFERER)
             .send()
             .await
-        {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => response.json::<Value>().await.ok(),
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
-        let Some(value) = value else {
-            return (String::new(), String::new(), String::new());
-        };
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?;
         let candidates = [
             ("song_play_url_sq", "无损"),
             ("song_play_url_pq", "高品质"),
@@ -190,15 +312,65 @@ impl QqSource {
                 .and_then(|url| url.rsplit('.').next())
                 .filter(|value| value.len() <= 5)
                 .unwrap_or("m4a");
-            return (url.into(), quality.into(), extension.into());
+            return Some((url.into(), quality.into(), extension.into()));
         }
-        (String::new(), String::new(), String::new())
+        None
+    }
+
+    // musicdl's `_parsewithlzmhhhapi` — POST, returns a plain MP3 URL (universally
+    // decodable, so a reliable last-resort that avoids FLAC/WebKit codec issues).
+    async fn resolve_lzmhhh(&self, song_mid: &str) -> Option<(String, String, String)> {
+        let value = self
+            .client
+            .post("https://music.lzmhhh.com/api/music/url")
+            .timeout(Duration::from_secs(8))
+            .header("User-Agent", QQ_UA)
+            .header("Referer", "https://music.lzmhhh.com/")
+            .header("Origin", "https://music.lzmhhh.com")
+            .form(&[("id", song_mid.to_string()), ("type", "qq".to_string())])
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?;
+        let url = value.get("data").and_then(Value::as_str)?;
+        if !url.starts_with("http") {
+            return None;
+        }
+        Some((url.to_string(), "320K".to_string(), "mp3".to_string()))
+    }
+
+    // musicdl's `_parsewithyutangxiaowuapi` — returns an MP3 URL for guests.
+    async fn resolve_yutangxiaowu(&self, song_mid: &str) -> Option<(String, String, String)> {
+        let value = self
+            .client
+            .get("https://api.yutangxiaowu.cn/api/v1/qqmusic/music")
+            .timeout(Duration::from_secs(8))
+            .query(&[("songmid", song_mid)])
+            .header("User-Agent", QQ_UA)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?;
+        let url = value.get("url").and_then(Value::as_str)?;
+        if !url.starts_with("http") {
+            return None;
+        }
+        Some((url.to_string(), "320K".to_string(), "mp3".to_string()))
     }
 
     async fn query_lyric(&self, song_mid: &str) -> Option<String> {
         let value = self
             .client
             .get("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg")
+            .timeout(Duration::from_secs(8))
             .query(&[
                 ("songmid", song_mid),
                 ("g_tk", "5381"),
@@ -229,7 +401,7 @@ impl QqSource {
         let (quality, format) = qq_quality(&song);
         Track {
             id: format!("qq:{}", song.mid),
-            source: "QQMusicClient".into(),
+            source: QQ_SOURCE.into(),
             title: song.title,
             artist: song
                 .singer
@@ -250,6 +422,36 @@ impl QqSource {
                 json!({"downloadHeaders": {"Referer": "http://y.qq.com", "User-Agent": QQ_UA}}),
             ),
         }
+    }
+}
+
+/// Higher number = better quality, used to prefer the best URL among resolvers
+/// that all returned candidates. Mirrors musicdl's QQ quality ordering.
+fn quality_rank(quality: &str) -> u8 {
+    match quality {
+        "臻品母带" => 8,
+        "无损" => 7,
+        "高品质" => 6,
+        "伴奏" => 5,
+        "320K" => 4,
+        "128K" => 3,
+        "低品质" => 2,
+        _ => 1,
+    }
+}
+
+/// Decodability of the container in the WebView. MP3 and M4A/AAC are universally
+/// supported by both WKWebView (macOS) and WebView2 (Windows/Chromium); FLAC/OGG
+/// are supported by WKWebView but are far more likely to fail through a custom
+/// `music://` scheme on WebView2, surfacing as MEDIA_ERR_SRC_NOT_SUPPORTED
+/// (error 4). So MP3/M4A is ranked above lossless FLAC for *streaming*.
+fn stream_preference(extension: &str, _quality: &str) -> u8 {
+    match extension.to_ascii_lowercase().as_str() {
+        "mp3" | "mpeg" => 4,
+        "m4a" | "mp4" | "aac" => 3,
+        "flac" => 2,
+        "ogg" | "oga" | "opus" | "wav" => 1,
+        _ => 0,
     }
 }
 
@@ -468,9 +670,9 @@ impl MusicSource for QqSource {
 
     async fn resolve_quality(&self, track: &Track) -> Option<(String, String)> {
         let song_mid = track.id.strip_prefix("qq:")?;
-        // The VKey path returns empty for guests, so the tang `_parsewithtangapi`
-        // decides the tier; its highest available one is what playback resolves.
-        let (_, quality, extension) = self.resolve_tang(song_mid).await;
+        // Match what playback will actually resolve: the highest streamable tier
+        // across the whole fallback chain, so the search card and playback agree.
+        let (_, quality, extension) = self.resolve_stream(song_mid).await;
         if quality.is_empty() {
             return None;
         }

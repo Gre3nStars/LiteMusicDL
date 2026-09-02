@@ -486,6 +486,25 @@ fn requested_local_range(
     Some((start, end))
 }
 
+/// Parse the browser's `Range: bytes=start-end` header for the remote proxy,
+/// where the full size is unknown ahead of time. Returns `(start, end)` or
+/// `None` when the header is absent/malformed. Open-ended ranges (`bytes=start-`)
+/// are clamped to a generous window so we don't download the whole file.
+fn requested_range(range: Option<&tauri::http::HeaderValue>) -> Option<(usize, usize)> {
+    const WINDOW: usize = 65_536;
+    let raw = range.and_then(|value| value.to_str().ok())?;
+    let raw = raw.trim().strip_prefix("bytes=")?;
+    let (start, end) = raw.split(',').next()?.split_once('-')?;
+    if start.is_empty() {
+        // suffix range `bytes=-N` -> last N bytes; approximate the tail.
+        let length = end.parse::<usize>().ok()?;
+        return Some((WINDOW.saturating_sub(length), WINDOW - 1));
+    }
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok().unwrap_or(start + WINDOW);
+    Some((start, end.max(start)))
+}
+
 #[tauri::command]
 async fn list_sources(state: State<'_, AppState>) -> Result<Vec<SourceDescriptor>, String> {
     Ok(registry(state.client.clone())
@@ -952,8 +971,9 @@ pub fn run() {
                 // WebKit normally asks for a Range immediately. If it does not,
                 // request only the opening segment ourselves so starting playback
                 // never waits for a complete lossless-file download.
-                let source_range =
-                    range.unwrap_or_else(|| tauri::http::HeaderValue::from_static("bytes=0-65535"));
+                let source_range = range.clone().unwrap_or_else(|| {
+                    tauri::http::HeaderValue::from_static("bytes=0-65535")
+                });
                 source_request = source_request.header(reqwest::header::RANGE, source_range);
                 if let Some(headers) = track
                     .adapter_payload
@@ -979,8 +999,13 @@ pub fn run() {
                         return;
                     }
                 };
-                let status = response.status();
+                let source_status = response.status();
                 let headers = response.headers().clone();
+                // Capture the full size before the body is consumed.
+                let source_total = headers
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok());
                 // A source may answer with a 200 HTML/JSON error page (e.g. a
                 // blocked or expired link). Serving it as audio makes WebKit
                 // "play" silence, so reject it and let the player surface an error.
@@ -1003,7 +1028,15 @@ pub fn run() {
                     return;
                 }
                 let content_type = media_content_type(&track, &headers);
-                let body = match response.bytes().await {
+                // WebView2/Chromium is strict about Range responses: the bytes we
+                // return and the `Content-Range`/`Content-Length`/HTTP status we
+                // advertise must agree exactly. Some source CDNs answer a ranged
+                // request with a full 200 body or no `Content-Range`; in that case
+                // slice to the requested window ourselves so Chromium's media
+                // pipeline doesn't abort with MEDIA_ERR_SRC_NOT_SUPPORTED (error 4).
+                let requested = requested_range(range.as_ref());
+                let mut status = source_status;
+                let mut body = match response.bytes().await {
                     Ok(body) => body.to_vec(),
                     Err(_) => {
                         responder.respond(
@@ -1020,7 +1053,19 @@ pub fn run() {
                     .header("Accept-Ranges", "bytes")
                     .header("Content-Type", content_type)
                     .header("Content-Length", body.len().to_string());
-                if let Some(content_range) = headers.get(reqwest::header::CONTENT_RANGE) {
+                if let Some((start, end)) = requested {
+                    // A full 200 body (not a 206) must be trimmed to the window and
+                    // be reported as a partial response so Chromium keeps seeking.
+                    if status == reqwest::StatusCode::OK && body.len() > end.saturating_sub(start) + 1 {
+                        body = body[start..=end].to_vec();
+                        status = reqwest::StatusCode::PARTIAL_CONTENT;
+                    }
+                    let total = source_total.unwrap_or(body.len() + (end - start));
+                    let content_range = format!("bytes {start}-{end}/{total}");
+                    builder = builder
+                        .status(status)
+                        .header("Content-Range", content_range);
+                } else if let Some(content_range) = headers.get(reqwest::header::CONTENT_RANGE) {
                     builder = builder.header("Content-Range", content_range);
                 }
                 responder.respond(builder.body(body).unwrap());
@@ -1045,7 +1090,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_audio_magic, is_lyric_file, local_lyrics_path, local_track, sniff_image_type};
+    use super::{has_audio_magic, is_lyric_file, local_lyrics_path, local_track, media_content_type, sniff_image_type};
+    use crate::domain::Track;
     use std::fs;
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -1116,5 +1162,71 @@ mod tests {
         assert_eq!(fs::read(found).unwrap(), b"[00:01.00]lyric");
         fs::remove_file(music).unwrap();
         fs::remove_file(lyrics).unwrap();
+    }
+
+    fn track(format: &str) -> Track {
+        Track {
+            id: "qq:test".into(),
+            source: "QQMusicClient".into(),
+            title: "t".into(),
+            artist: String::new(),
+            album: String::new(),
+            artwork_url: String::new(),
+            audio_url: "https://x/foo.flac".into(),
+            duration_ms: 0,
+            format: Some(format.into()),
+            quality: None,
+            adapter_payload: None,
+        }
+    }
+
+    fn headers_with(content_type: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_str(content_type).unwrap(),
+        );
+        headers
+    }
+
+    // QQ/HK0 love to serve FLAC bytes as `audio/x-ogg`, which the WebView rejects
+    // with MEDIA_ERR_SRC_NOT_SUPPORTED (error 4). The proxy must re-label by the
+    // resolved container, not echo the bogus header.
+    #[test]
+    fn media_content_type_trusts_container_over_bogus_ogg_header() {
+        let headers = headers_with("audio/x-ogg");
+        assert_eq!(media_content_type(&track("flac"), &headers), "audio/flac");
+        assert_eq!(media_content_type(&track("FLAC"), &headers), "audio/flac");
+        // A real OGG keeps its own type.
+        assert_eq!(media_content_type(&track("ogg"), &headers), "audio/ogg");
+    }
+
+    #[test]
+    fn media_content_type_maps_lossless_mislabel_as_mpeg() {
+        // Netease/QQ can deliver FLAC bytes labelled audio/mpeg.
+        let headers = headers_with("audio/mpeg");
+        assert_eq!(media_content_type(&track("flac"), &headers), "audio/flac");
+        // Genuine MP3 stays MP3.
+        assert_eq!(media_content_type(&track("mp3"), &headers), "audio/mpeg");
+    }
+
+    fn range_header(value: &str) -> tauri::http::HeaderValue {
+        tauri::http::HeaderValue::from_str(value).unwrap()
+    }
+
+    #[test]
+    fn requested_range_parses_explicit_and_open_ended() {
+        // Explicit `bytes=0-1023`.
+        assert_eq!(
+            super::requested_range(Some(&range_header("bytes=0-1023"))),
+            Some((0, 1023))
+        );
+        // Open-ended `bytes=0-` clamps to a window instead of downloading all bytes.
+        let (start, end) = super::requested_range(Some(&range_header("bytes=100-"))).unwrap();
+        assert_eq!(start, 100);
+        assert!(end >= start);
+        // Missing / malformed header -> None (serve full body).
+        assert_eq!(super::requested_range(None), None);
+        assert_eq!(super::requested_range(Some(&range_header("garbage"))), None);
     }
 }

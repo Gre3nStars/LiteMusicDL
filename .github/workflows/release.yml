@@ -161,15 +161,29 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Build (.exe NSIS installer)
+      - name: Build (NSIS installer and raw exe)
         run: pnpm tauri build
 
-      - name: Upload exe artifact
+      - name: Rename standalone exe
+        shell: pwsh
+        run: |
+          # Keep the compact raw executable as a portable, no-install option.
+          Copy-Item src-tauri/target/release/litemusicdl.exe src-tauri/target/release/LiteMusicDL-portable.exe
+
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: LiteMusicDL-windows-nsis
+          name: LiteMusicDL-windows-installer
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: warn
+
+      - name: Upload portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteMusicDL-windows-portable
+          path: |
+            src-tauri/target/release/LiteMusicDL-portable.exe
           if-no-files-found: warn
 
   release:
@@ -198,6 +212,7 @@ jobs:
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.exe
+            artifacts/**/LiteMusicDL-portable.exe
           # Both platform jobs normally run and upload one artifact each, so all
           # globs match. When a manual dispatch disables a platform, the missing
           # files are skipped instead of failing the release.

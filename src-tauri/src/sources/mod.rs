@@ -69,6 +69,27 @@ mod live_tests {
     }
 
     #[tokio::test]
+    async fn qq_resolves_variety() {
+        let src = QqSource::new(client());
+        for (q, id) in [
+            ("晴天", "qq:0039MnYb0qxYhV"),
+            ("温柔", "qq:003L6xyk0vvEeA"),
+            ("七里香", "qq:004Z8Ihr0JIu5s"),
+        ] {
+            let track = crate::domain::Track {
+                id: id.into(), source: "QQMusicClient".into(),
+                title: q.into(), artist: String::new(), album: String::new(),
+                artwork_url: String::new(), audio_url: String::new(),
+                duration_ms: 0, format: None, quality: None, adapter_payload: None,
+            };
+            match src.resolve_track(&track).await {
+                Ok(r) => assert!(r.audio_url.starts_with("http"), "{q} NOT resolved: {:?}", r.audio_url),
+                Err(e) => eprintln!("{q} resolve skipped (may be locked/rate-limited): {e}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn kuwo_search_and_resolve() {
         let src = KuwoSource::new(client());
         let tracks = src.search("晴天", 1, 1).await.expect("kuwo search");

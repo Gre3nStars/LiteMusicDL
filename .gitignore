@@ -2,6 +2,7 @@ node_modules/
 dist/
 release/
 src-tauri/target/
+.pnpm-store/
 .DS_Store
 *.log
 *.dmg
