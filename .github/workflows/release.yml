@@ -1,0 +1,176 @@
+name: Release (macOS + Windows)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: "Build macOS (.dmg)"
+        required: false
+        type: boolean
+        default: true
+      windows:
+        description: "Build Windows (.exe NSIS)"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+    steps:
+      - name: Resolve version
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "version=0.0.0" >> "$GITHUB_OUTPUT"
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+          else
+            # Prefer the pushed tag; fall back to a version tag on the branch.
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            [ -n "$VERSION" ] || VERSION="0.0.0"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-macos:
+    needs: detect
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.macos) }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: tauri-macos-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build (.app + .dmg)
+        run: pnpm tauri build
+        # No signing/notarization secrets are configured, so Tauri skips codesign
+        # and produces an unsigned, adhoc-signed .app + .dmg. To release signed
+        # macOS builds, add APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+        # APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID as secrets and uncomment:
+        # env:
+        #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        #   APPLE_ID: ${{ secrets.APPLE_ID }}
+        #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteMusicDL-macos-dmg
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: warn
+
+  build-windows:
+    needs: detect
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.windows) }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: tauri-win-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install NSIS (makensis)
+        run: choco install nsis --yes --no-progress
+
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build (.exe NSIS installer)
+        run: pnpm tauri build
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteMusicDL-windows-nsis
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: warn
+
+  release:
+    needs: [detect, build-macos, build-windows]
+    if: ${{ !cancelled() && needs.detect.outputs.release_tag != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect.outputs.release_tag }}
+          name: LiteMusicDL ${{ needs.detect.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.exe
+          fail_on_unmatched_files: true
