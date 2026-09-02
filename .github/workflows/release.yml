@@ -173,4 +173,7 @@ jobs:
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.exe
-          fail_on_unmatched_files: true
+          # Both platform jobs normally run and upload one artifact each, so all
+          # globs match. When a manual dispatch disables a platform, the missing
+          # files are skipped instead of failing the release.
+          fail_on_unmatched_files: false
