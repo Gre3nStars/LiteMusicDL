@@ -21,7 +21,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' customprotocol: asset:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' asset: localart: http: https: data: blob:; media-src 'self' asset: music: http: https: data: blob:; connect-src 'self' ipc: http://ipc.localhost"
+      "csp": "default-src 'self' customprotocol: asset:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' asset: localart: http: https: data: blob:; media-src 'self' asset: http://127.0.0.1 http: https: data: blob:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1"
     }
   },
   "bundle": {

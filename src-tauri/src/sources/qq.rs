@@ -105,15 +105,10 @@ impl QqSource {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        // Playback reliability first: a universally-decodable MP3/M4A beats a
-        // lossless FLAC, because WebView2 (Windows) rejects FLAC served through a
-        // custom scheme far more often than it rejects MP3. Within a codec family,
-        // higher quality wins.
-        results.sort_by(|a, b| {
-            stream_preference(&b.2, &b.1)
-                .cmp(&stream_preference(&a.2, &a.1))
-                .then_with(|| quality_rank(&b.1).cmp(&quality_rank(&a.1)))
-        });
+        // Best available source wins: 无损/FLAC beats 320K beats 128K. The proxy
+        // re-labels the container correctly, so lossless plays everywhere it's
+        // decodable — we never trade down the quality the source offers.
+        results.sort_by(|a, b| quality_rank(&b.1).cmp(&quality_rank(&a.1)));
         for (url, quality, extension) in results {
             if !url.is_empty() && self.streamable(&url, &extension).await {
                 return (url, quality, extension);
@@ -437,21 +432,6 @@ fn quality_rank(quality: &str) -> u8 {
         "128K" => 3,
         "低品质" => 2,
         _ => 1,
-    }
-}
-
-/// Decodability of the container in the WebView. MP3 and M4A/AAC are universally
-/// supported by both WKWebView (macOS) and WebView2 (Windows/Chromium); FLAC/OGG
-/// are supported by WKWebView but are far more likely to fail through a custom
-/// `music://` scheme on WebView2, surfacing as MEDIA_ERR_SRC_NOT_SUPPORTED
-/// (error 4). So MP3/M4A is ranked above lossless FLAC for *streaming*.
-fn stream_preference(extension: &str, _quality: &str) -> u8 {
-    match extension.to_ascii_lowercase().as_str() {
-        "mp3" | "mpeg" => 4,
-        "m4a" | "mp4" | "aac" => 3,
-        "flac" => 2,
-        "ogg" | "oga" | "opus" | "wav" => 1,
-        _ => 0,
     }
 }
 

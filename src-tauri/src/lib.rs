@@ -13,10 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use tauri::{AppHandle, Manager, State};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 struct AppState {
     client: reqwest::Client,
@@ -26,9 +26,18 @@ struct PlaybackState {
     tracks: Mutex<HashMap<String, Track>>,
     next_id: AtomicU64,
 }
-
 struct DownloadState {
     cancels: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+}
+
+/// The loopback media server's bound port plus the shared playback map.
+/// `prepare_playback` inserts the resolved track into `tracks` and emits an
+/// `http://127.0.0.1:{port}/{token}` URL (WebView2 refuses custom-scheme media
+/// with error 4, but streams `http://127.0.0.1` reliably). The server reads the
+/// same map to stream bytes back to the WebView.
+struct MediaServerState {
+    port: u16,
+    tracks: Arc<Mutex<HashMap<String, Track>>>,
 }
 
 #[derive(Clone)]
@@ -505,6 +514,277 @@ fn requested_range(range: Option<&tauri::http::HeaderValue>) -> Option<(usize, u
     Some((start, end.max(start)))
 }
 
+/// Build the HTTP response for a streamed track. Shared by the loopback media
+/// server and the custom `music://` protocol so both behave identically and
+/// serve correct Range/Content-Type headers across WKWebView and WebView2.
+struct StreamResponse {
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+    content_range: Option<String>,
+}
+
+async fn stream_track(
+    client: reqwest::Client,
+    track: &Track,
+    range: Option<&tauri::http::HeaderValue>,
+) -> StreamResponse {
+    // Local file: serve the requested byte window directly.
+    if let Some(path) = local_path(track) {
+        if let Ok(metadata) = tokio::fs::metadata(&path).await {
+            let total = metadata.len();
+            let Some((start, end)) = requested_local_range(range, total) else {
+                return StreamResponse {
+                    status: 416,
+                    content_type: String::new(),
+                    body: Vec::new(),
+                    content_range: Some(format!("bytes */{total}")),
+                };
+            };
+            let length = (end - start + 1) as usize;
+            let body = match tokio::fs::File::open(&path).await {
+                Ok(mut file) => {
+                    let result = async {
+                        file.seek(std::io::SeekFrom::Start(start)).await?;
+                        let mut buf = vec![0; length];
+                        file.read_exact(&mut buf).await?;
+                        Ok::<_, std::io::Error>(buf)
+                    }
+                    .await;
+                    result.unwrap_or_default()
+                }
+                Err(_) => Vec::new(),
+            };
+            return StreamResponse {
+                status: 206,
+                content_type: media_content_type(track, &reqwest::header::HeaderMap::new()),
+                body,
+                content_range: Some(format!("bytes {start}-{end}/{total}")),
+            };
+        }
+    }
+
+    // Remote source: fetch the upstream URL (with Range + download headers).
+    let source_range = range.cloned().unwrap_or_else(|| {
+        tauri::http::HeaderValue::from_static("bytes=0-65535")
+    });
+    let mut source_request = client.get(&track.audio_url);
+    source_request = source_request.header(reqwest::header::RANGE, source_range);
+    if let Some(headers) = track
+        .adapter_payload
+        .as_ref()
+        .and_then(|payload| payload.get("downloadHeaders"))
+        .and_then(|value| value.as_object())
+    {
+        for (name, value) in headers {
+            if let Some(value) = value.as_str() {
+                source_request = source_request.header(name, value);
+            }
+        }
+    }
+    let Ok(response) = source_request.send().await else {
+        return StreamResponse {
+            status: 502,
+            content_type: String::new(),
+            body: Vec::new(),
+            content_range: None,
+        };
+    };
+    let source_status = response.status();
+    let headers = response.headers().clone();
+    let source_total = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    // A blocked/expired link answering with an HTML/JSON error page is never audio.
+    let source_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if source_type.contains("text/html")
+        || source_type.contains("application/json")
+        || source_type.contains("application/xml")
+        || source_type.contains("text/plain")
+    {
+        return StreamResponse {
+            status: 502,
+            content_type: String::new(),
+            body: Vec::new(),
+            content_range: None,
+        };
+    }
+    let content_type = media_content_type(track, &headers);
+    let requested = requested_range(range);
+    let mut status = source_status.as_u16();
+    let mut body = match response.bytes().await {
+        Ok(body) => body.to_vec(),
+        Err(_) => {
+            return StreamResponse {
+                status: 502,
+                content_type: String::new(),
+                body: Vec::new(),
+                content_range: None,
+            };
+        }
+    };
+    let mut content_range = None;
+    if let Some((start, end)) = requested {
+        // A full 200 body (not a 206) must be trimmed to the window and reported
+        // as a partial response so Chromium can keep seeking.
+        if source_status == reqwest::StatusCode::OK && body.len() > end.saturating_sub(start) + 1 {
+            body = body[start..=end].to_vec();
+            status = 206;
+        }
+        let total = source_total.unwrap_or(body.len() + (end - start));
+        content_range = Some(format!("bytes {start}-{end}/{total}"));
+    } else if let Some(value) = headers.get(reqwest::header::CONTENT_RANGE) {
+        content_range = Some(value.to_str().unwrap_or_default().to_owned());
+    }
+    StreamResponse {
+        status,
+        content_type,
+        body,
+        content_range,
+    }
+}
+
+/// Bind a loopback HTTP listener and serve `GET /{token}` by streaming the
+/// stored track. Returns the accept-loop handle and the bound port. Port `0`
+/// lets the OS pick a free one (no conflicts with other apps). Only
+/// `127.0.0.1` is bound, so it is never reachable from the network.
+fn spawn_media_server(
+    client: reqwest::Client,
+    tracks: Arc<Mutex<HashMap<String, Track>>>,
+) -> (tauri::async_runtime::JoinHandle<()>, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind media server");
+    listener
+        .set_nonblocking(true)
+        .expect("failed to set media server non-blocking");
+    let port = listener.local_addr().expect("media server port").port();
+    let handle = tauri::async_runtime::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .expect("failed to adopt media server listener");
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let tracks = tracks.clone();
+            let client = client.clone();
+            tauri::async_runtime::spawn(async move {
+                let request = match read_http_request(&mut stream).await {
+                    Some(request) => request,
+                    None => return,
+                };
+                let token = request.path.trim_start_matches('/').to_string();
+                let track = tracks.lock().ok().and_then(|map| map.get(&token).cloned());
+                let Some(track) = track else {
+                    let _ = write_http_response(&mut stream, 404, "text/plain", &[]).await;
+                    return;
+                };
+                let res = stream_track(client, &track, request.range.as_ref()).await;
+                let body = res.body;
+                // We already trimmed to the requested window in `stream_track`;
+                // `content_range` (if any) describes the returned slice.
+                let _ = write_http_response_ext(
+                    &mut stream,
+                    res.status,
+                    &res.content_type,
+                    &body,
+                    res.content_range.as_deref(),
+                )
+                .await;
+            });
+        }
+    });
+    (handle, port)
+}
+
+struct HttpRequest {
+    path: String,
+    range: Option<tauri::http::HeaderValue>,
+}
+
+/// Read and parse a minimal HTTP/1.1 request head (request line + headers).
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<HttpRequest> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        // Headers end at the first blank line (\r\n\r\n or \n\n).
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.windows(2).any(|w| w == b"\n\n") {
+            break;
+        }
+        if buf.len() > 16 * 1024 {
+            return None;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let _method = parts.next()?;
+    let target = parts.next()?;
+    let range = lines
+        .find_map(|line| {
+            let line = line.trim();
+            let lower = line.to_ascii_lowercase();
+            lower
+                .strip_prefix("range:")
+                .map(|value| tauri::http::HeaderValue::from_str(value.trim()).ok())
+                .flatten()
+        });
+    Some(HttpRequest {
+        path: target.to_string(),
+        range,
+    })
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    write_http_response_ext(stream, status, content_type, body, None).await
+}
+
+async fn write_http_response_ext(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    content_range: Option<&str>,
+) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        206 => "Partial Content",
+        404 => "Not Found",
+        416 => "Range Not Satisfiable",
+        502 => "Bad Gateway",
+        _ => "OK",
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n",
+        body.len()
+    );
+    if let Some(cr) = content_range {
+        response.push_str(&format!("Content-Range: {cr}\r\n"));
+    }
+    response.push_str("\r\n");
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn list_sources(state: State<'_, AppState>) -> Result<Vec<SourceDescriptor>, String> {
     Ok(registry(state.client.clone())
@@ -813,41 +1093,59 @@ async fn save_download_history(app: AppHandle, records: Vec<Value>) -> Result<()
 async fn prepare_playback(
     state: State<'_, AppState>,
     playback: State<'_, PlaybackState>,
+    media: State<'_, MediaServerState>,
     mut track: Track,
 ) -> Result<Track, String> {
     // Resolve the real stream (and its source-reported quality/format) before
     // handing it to the WebView, so the resolved metadata reaches the UI.
     let resolved = resolve_track_for_action(state.client.clone(), track.clone()).await?;
     let token = playback.next_id.fetch_add(1, Ordering::Relaxed).to_string();
-    playback
+    media
         .tracks
         .lock()
         .map_err(|_| "播放会话不可用".to_string())?
         .insert(token.clone(), resolved.clone());
-    // Replace the upstream source URL with the proxied playback URI; the native
-    // `music://` handler still fetches from the stored upstream URL.
+    // Replace the upstream URL with a loopback HTTP URL served by the media
+    // server. WebView2/Chromium refuses media from a custom scheme (error 4)
+    // but plays `http://127.0.0.1` reliably, so we route playback over a real
+    // loopback HTTP listener rather than the `music://` protocol.
     track = resolved;
-    track.audio_url = format!("music://localhost/{token}");
+    track.audio_url = format!("http://127.0.0.1:{}/{token}", media.port);
     Ok(track)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let client = build_client();
+    let tracks = Arc::new(Mutex::new(HashMap::new()));
+
+    // Start a loopback HTTP media server. WebView2 plays `http://127.0.0.1`
+    // media reliably, so the frontend streams through this listener instead of
+    // the custom `music://` scheme (which Chromium rejects with error 4).
+    let (server, port) = spawn_media_server(client.clone(), tracks.clone());
+    let media_server = MediaServerState { port, tracks };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
-            client: build_client(),
+            client: client.clone(),
         })
         .manage(PlaybackState {
             tracks: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         })
+        .manage(media_server)
         .manage(LocalArtworkState {
             artwork: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         })
         .manage(DownloadState {
             cancels: Mutex::new(HashMap::new()),
+        })
+        .setup(|_app| {
+            // Keep the server alive for the lifetime of the app.
+            std::mem::forget(server);
+            Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("localart", |context, request, responder| {
             let token = request.uri().path().trim_start_matches('/');
@@ -897,178 +1195,16 @@ pub fn run() {
                     );
                     return;
                 };
-                if let Some(path) = local_path(&track) {
-                    let metadata = match tokio::fs::metadata(&path).await {
-                        Ok(metadata) => metadata,
-                        Err(_) => {
-                            responder.respond(
-                                tauri::http::Response::builder()
-                                    .status(404)
-                                    .body(Vec::new())
-                                    .unwrap(),
-                            );
-                            return;
-                        }
-                    };
-                    let total = metadata.len();
-                    let Some((start, end)) = requested_local_range(range.as_ref(), total) else {
-                        responder.respond(
-                            tauri::http::Response::builder()
-                                .status(416)
-                                .header("Content-Range", format!("bytes */{total}"))
-                                .body(Vec::new())
-                                .unwrap(),
-                        );
-                        return;
-                    };
-                    let length = (end - start + 1) as usize;
-                    let mut file = match tokio::fs::File::open(&path).await {
-                        Ok(file) => file,
-                        Err(_) => {
-                            responder.respond(
-                                tauri::http::Response::builder()
-                                    .status(404)
-                                    .body(Vec::new())
-                                    .unwrap(),
-                            );
-                            return;
-                        }
-                    };
-                    let result = async {
-                        file.seek(std::io::SeekFrom::Start(start)).await?;
-                        let mut body = vec![0; length];
-                        file.read_exact(&mut body).await?;
-                        Ok::<_, std::io::Error>(body)
-                    }
-                    .await;
-                    let body = match result {
-                        Ok(body) => body,
-                        Err(_) => {
-                            responder.respond(
-                                tauri::http::Response::builder()
-                                    .status(500)
-                                    .body(Vec::new())
-                                    .unwrap(),
-                            );
-                            return;
-                        }
-                    };
-                    let content_type =
-                        media_content_type(&track, &reqwest::header::HeaderMap::new());
-                    responder.respond(
-                        tauri::http::Response::builder()
-                            .status(206)
-                            .header("Accept-Ranges", "bytes")
-                            .header("Content-Type", content_type)
-                            .header("Content-Length", body.len().to_string())
-                            .header("Content-Range", format!("bytes {start}-{end}/{total}"))
-                            .body(body)
-                            .unwrap(),
-                    );
-                    return;
-                }
-                let mut source_request = client.get(&track.audio_url);
-                // WebKit normally asks for a Range immediately. If it does not,
-                // request only the opening segment ourselves so starting playback
-                // never waits for a complete lossless-file download.
-                let source_range = range.clone().unwrap_or_else(|| {
-                    tauri::http::HeaderValue::from_static("bytes=0-65535")
-                });
-                source_request = source_request.header(reqwest::header::RANGE, source_range);
-                if let Some(headers) = track
-                    .adapter_payload
-                    .as_ref()
-                    .and_then(|payload| payload.get("downloadHeaders"))
-                    .and_then(|value| value.as_object())
-                {
-                    for (name, value) in headers {
-                        if let Some(value) = value.as_str() {
-                            source_request = source_request.header(name, value);
-                        }
-                    }
-                }
-                let response = match source_request.send().await {
-                    Ok(response) => response,
-                    Err(_) => {
-                        responder.respond(
-                            tauri::http::Response::builder()
-                                .status(502)
-                                .body(Vec::new())
-                                .unwrap(),
-                        );
-                        return;
-                    }
-                };
-                let source_status = response.status();
-                let headers = response.headers().clone();
-                // Capture the full size before the body is consumed.
-                let source_total = headers
-                    .get(reqwest::header::CONTENT_LENGTH)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<usize>().ok());
-                // A source may answer with a 200 HTML/JSON error page (e.g. a
-                // blocked or expired link). Serving it as audio makes WebKit
-                // "play" silence, so reject it and let the player surface an error.
-                let source_type = headers
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if source_type.contains("text/html")
-                    || source_type.contains("application/json")
-                    || source_type.contains("application/xml")
-                    || source_type.contains("text/plain")
-                {
-                    responder.respond(
-                        tauri::http::Response::builder()
-                            .status(502)
-                            .body(Vec::new())
-                            .unwrap(),
-                    );
-                    return;
-                }
-                let content_type = media_content_type(&track, &headers);
-                // WebView2/Chromium is strict about Range responses: the bytes we
-                // return and the `Content-Range`/`Content-Length`/HTTP status we
-                // advertise must agree exactly. Some source CDNs answer a ranged
-                // request with a full 200 body or no `Content-Range`; in that case
-                // slice to the requested window ourselves so Chromium's media
-                // pipeline doesn't abort with MEDIA_ERR_SRC_NOT_SUPPORTED (error 4).
-                let requested = requested_range(range.as_ref());
-                let mut status = source_status;
-                let mut body = match response.bytes().await {
-                    Ok(body) => body.to_vec(),
-                    Err(_) => {
-                        responder.respond(
-                            tauri::http::Response::builder()
-                                .status(502)
-                                .body(Vec::new())
-                                .unwrap(),
-                        );
-                        return;
-                    }
-                };
+                let res = stream_track(client, &track, range.as_ref()).await;
                 let mut builder = tauri::http::Response::builder()
-                    .status(status)
+                    .status(res.status)
                     .header("Accept-Ranges", "bytes")
-                    .header("Content-Type", content_type)
-                    .header("Content-Length", body.len().to_string());
-                if let Some((start, end)) = requested {
-                    // A full 200 body (not a 206) must be trimmed to the window and
-                    // be reported as a partial response so Chromium keeps seeking.
-                    if status == reqwest::StatusCode::OK && body.len() > end.saturating_sub(start) + 1 {
-                        body = body[start..=end].to_vec();
-                        status = reqwest::StatusCode::PARTIAL_CONTENT;
-                    }
-                    let total = source_total.unwrap_or(body.len() + (end - start));
-                    let content_range = format!("bytes {start}-{end}/{total}");
-                    builder = builder
-                        .status(status)
-                        .header("Content-Range", content_range);
-                } else if let Some(content_range) = headers.get(reqwest::header::CONTENT_RANGE) {
-                    builder = builder.header("Content-Range", content_range);
+                    .header("Content-Type", res.content_type)
+                    .header("Content-Length", res.body.len().to_string());
+                if let Some(cr) = res.content_range {
+                    builder = builder.header("Content-Range", cr);
                 }
-                responder.respond(builder.body(body).unwrap());
+                responder.respond(builder.body(res.body).unwrap());
             });
         })
         .invoke_handler(tauri::generate_handler![
@@ -1090,7 +1226,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_audio_magic, is_lyric_file, local_lyrics_path, local_track, media_content_type, sniff_image_type};
+    use super::{
+        has_audio_magic, is_lyric_file, local_lyrics_path, local_track, media_content_type,
+        stream_track, sniff_image_type,
+    };
     use crate::domain::Track;
     use std::fs;
 
@@ -1228,5 +1367,26 @@ mod tests {
         // Missing / malformed header -> None (serve full body).
         assert_eq!(super::requested_range(None), None);
         assert_eq!(super::requested_range(Some(&range_header("garbage"))), None);
+    }
+
+    #[tokio::test]
+    async fn stream_track_serves_local_file_range() {
+        // Write a small local FLAC file and build its Track through local_track.
+        let path = fixture_path("media.flac");
+        let mut bytes = b"fLaC".to_vec();
+        bytes.extend_from_slice(&[0u8; 100]);
+        fs::write(&path, &bytes).unwrap();
+        let (track, _art) = local_track(&path).expect("local_track should detect the flac");
+
+        let client = reqwest::Client::new();
+        let range = range_header("bytes=0-15");
+        let res = stream_track(client, &track, Some(&range)).await;
+        assert_eq!(res.status, 206);
+        assert_eq!(res.content_type, "audio/flac");
+        assert_eq!(res.body.len(), 16);
+        assert_eq!(&res.body[..4], b"fLaC");
+        assert!(res.content_range.as_deref().unwrap_or("").starts_with("bytes 0-15/"));
+
+        fs::remove_file(path).unwrap();
     }
 }
