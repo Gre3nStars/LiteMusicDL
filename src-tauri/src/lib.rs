@@ -4,6 +4,7 @@ mod sources;
 
 use crate::domain::{SourceDescriptor, Track};
 use futures_util::future::join_all;
+use futures_util::StreamExt;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::PictureType;
 use lofty::prelude::Accessor;
@@ -46,8 +47,12 @@ struct LocalArtwork {
     bytes: Vec<u8>,
 }
 
+/// The artwork map is shared (via `Arc`) with the loopback media server so local
+/// cover art can be served over `http://127.0.0.1:{port}/art/{token}`, which
+/// WebView2 loads reliably. The old `localart://` custom scheme is refused by
+/// WebView2 for images, so covers silently failed on Windows.
 struct LocalArtworkState {
-    artwork: Mutex<HashMap<String, LocalArtwork>>,
+    artwork: Arc<Mutex<HashMap<String, LocalArtwork>>>,
     next_id: AtomicU64,
 }
 
@@ -617,29 +622,81 @@ async fn stream_track(
     let content_type = media_content_type(track, &headers);
     let requested = requested_range(range);
     let mut status = source_status.as_u16();
-    let mut body = match response.bytes().await {
-        Ok(body) => body.to_vec(),
-        Err(_) => {
+    let mut body;
+    let mut content_range = None;
+    if let Some((start, end)) = requested {
+        // Stream only the requested byte window from the upstream so the first
+        // bytes reach the WebView promptly. Reading the whole body first (as a
+        // source that ignores `Range` can return) stalls a slow/large stream and
+        // trips the frontend's stall watchdog. If the upstream honoured our
+        // range (206) the body already begins at `start`; otherwise (200) we
+        // skip `start` bytes before copying the window.
+        let window = end - start + 1;
+        let is_partial = source_status == reqwest::StatusCode::PARTIAL_CONTENT;
+        let mut skip = if is_partial { 0usize } else { start };
+        let mut stream = response.bytes_stream();
+        body = Vec::with_capacity(window.min(1 << 20));
+        while body.len() < window {
+            let chunk = match stream.next().await {
+                Some(Ok(chunk)) => chunk,
+                _ => break,
+            };
+            let cursor = if skip > 0 {
+                let take = chunk.len().min(skip);
+                skip -= take;
+                &chunk[take..]
+            } else {
+                &chunk[..]
+            };
+            if cursor.is_empty() {
+                continue;
+            }
+            let take = cursor.len().min(window - body.len());
+            body.extend_from_slice(&cursor[..take]);
+        }
+        // A full 200 body that ended before `start` cannot satisfy the request.
+        if !is_partial && skip > 0 {
             return StreamResponse {
-                status: 502,
+                status: 416,
                 content_type: String::new(),
                 body: Vec::new(),
                 content_range: None,
             };
         }
-    };
-    let mut content_range = None;
-    if let Some((start, end)) = requested {
-        // A full 200 body (not a 206) must be trimmed to the window and reported
-        // as a partial response so Chromium can keep seeking.
-        if source_status == reqwest::StatusCode::OK && body.len() > end.saturating_sub(start) + 1 {
-            body = body[start..=end].to_vec();
-            status = 206;
+        status = 206;
+        // Report the real total so the media element can seek and report duration;
+        // prefer the upstream Content-Length, then its Content-Range total.
+        let total = source_total
+            .or_else(|| {
+                headers
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.rsplit('/').next())
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or_else(|| start + body.len());
+        // Describe the bytes actually served (the file may be shorter than the
+        // requested window), so the media element never sees an oversized range.
+        if body.is_empty() {
+            content_range = Some(format!("bytes {start}-{}/{total}", start.saturating_sub(1)));
+        } else {
+            content_range = Some(format!("bytes {start}-{}/{total}", start + body.len() - 1));
         }
-        let total = source_total.unwrap_or(body.len() + (end - start));
-        content_range = Some(format!("bytes {start}-{end}/{total}"));
-    } else if let Some(value) = headers.get(reqwest::header::CONTENT_RANGE) {
-        content_range = Some(value.to_str().unwrap_or_default().to_owned());
+    } else {
+        body = match response.bytes().await {
+            Ok(body) => body.to_vec(),
+            Err(_) => {
+                return StreamResponse {
+                    status: 502,
+                    content_type: String::new(),
+                    body: Vec::new(),
+                    content_range: None,
+                };
+            }
+        };
+        if let Some(value) = headers.get(reqwest::header::CONTENT_RANGE) {
+            content_range = Some(value.to_str().unwrap_or_default().to_owned());
+        }
     }
     StreamResponse {
         status,
@@ -656,6 +713,7 @@ async fn stream_track(
 fn spawn_media_server(
     client: reqwest::Client,
     tracks: Arc<Mutex<HashMap<String, Track>>>,
+    artwork: Arc<Mutex<HashMap<String, LocalArtwork>>>,
 ) -> (tauri::async_runtime::JoinHandle<()>, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind media server");
     listener
@@ -672,13 +730,38 @@ fn spawn_media_server(
             };
             let tracks = tracks.clone();
             let client = client.clone();
+            let artwork = artwork.clone();
             tauri::async_runtime::spawn(async move {
                 let request = match read_http_request(&mut stream).await {
                     Some(request) => request,
                     None => return,
                 };
-                let token = request.path.trim_start_matches('/').to_string();
-                let track = tracks.lock().ok().and_then(|map| map.get(&token).cloned());
+                let path = request.path.trim_start_matches('/').to_string();
+                // Local artwork is served over loopback HTTP (not the localart://
+                // custom scheme), because WebView2 refuses custom-scheme images.
+                if let Some(token) = path.strip_prefix("art/") {
+                    let image = artwork
+                        .lock()
+                        .ok()
+                        .and_then(|images| images.get(token).cloned());
+                    match image {
+                        Some(image) => {
+                            let _ = write_http_response_ext(
+                                &mut stream,
+                                200,
+                                &image.content_type,
+                                &image.bytes,
+                                None,
+                            )
+                            .await;
+                        }
+                        None => {
+                            let _ = write_http_response(&mut stream, 404, "text/plain", &[]).await;
+                        }
+                    }
+                    return;
+                }
+                let track = tracks.lock().ok().and_then(|map| map.get(&path).cloned());
                 let Some(track) = track else {
                     let _ = write_http_response(&mut stream, 404, "text/plain", &[]).await;
                     return;
@@ -901,6 +984,7 @@ async fn resolve_track_for_action(client: reqwest::Client, track: Track) -> Resu
 #[tauri::command]
 async fn scan_local_music(
     artwork_state: State<'_, LocalArtworkState>,
+    media: State<'_, MediaServerState>,
     directory: String,
 ) -> Result<Vec<Track>, String> {
     let directory = PathBuf::from(directory.trim());
@@ -934,7 +1018,9 @@ async fn scan_local_music(
                     .fetch_add(1, Ordering::Relaxed)
                     .to_string();
                 artwork.insert(token.clone(), image);
-                track.artwork_url = format!("localart://localhost/{token}");
+                // WebView2 refuses images from the `localart://` custom scheme, so
+                // route cover art through the loopback HTTP server like audio.
+                track.artwork_url = format!("http://127.0.0.1:{}/art/{token}", media.port);
             }
             track
         })
@@ -1183,7 +1269,8 @@ pub fn run() {
     // Start a loopback HTTP media server. WebView2 plays `http://127.0.0.1`
     // media reliably, so the frontend streams through this listener instead of
     // the custom `music://` scheme (which Chromium rejects with error 4).
-    let (server, port) = spawn_media_server(client.clone(), tracks.clone());
+    let artwork = Arc::new(Mutex::new(HashMap::new()));
+    let (server, port) = spawn_media_server(client.clone(), tracks.clone(), artwork.clone());
     let media_server = MediaServerState { port, tracks };
 
     tauri::Builder::default()
@@ -1197,7 +1284,7 @@ pub fn run() {
         })
         .manage(media_server)
         .manage(LocalArtworkState {
-            artwork: Mutex::new(HashMap::new()),
+            artwork,
             next_id: AtomicU64::new(1),
         })
         .manage(DownloadState {
@@ -1207,33 +1294,6 @@ pub fn run() {
             // Keep the server alive for the lifetime of the app.
             std::mem::forget(server);
             Ok(())
-        })
-        .register_asynchronous_uri_scheme_protocol("localart", |context, request, responder| {
-            let token = request.uri().path().trim_start_matches('/');
-            let artwork = context
-                .app_handle()
-                .state::<LocalArtworkState>()
-                .artwork
-                .lock()
-                .ok()
-                .and_then(|images| images.get(token).cloned());
-            match artwork {
-                Some(artwork) => responder.respond(
-                    tauri::http::Response::builder()
-                        .status(200)
-                        .header("Content-Type", artwork.content_type)
-                        .header("Content-Length", artwork.bytes.len().to_string())
-                        .header("Cache-Control", "no-store")
-                        .body(artwork.bytes)
-                        .unwrap(),
-                ),
-                None => responder.respond(
-                    tauri::http::Response::builder()
-                        .status(404)
-                        .body(Vec::new())
-                        .unwrap(),
-                ),
-            }
         })
         .register_asynchronous_uri_scheme_protocol("music", |context, request, responder| {
             let token = request.uri().path().trim_start_matches('/').to_string();

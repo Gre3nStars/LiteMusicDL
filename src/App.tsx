@@ -230,10 +230,14 @@ export default function App() {
   }, [isPlaying, currentTrack, volume]);
   // Watchdog: if we think we're "playing" but the media isn't advancing (slow /
   // stalled/blocked source), stop pretending and surface a clear message instead
-  // of letting the timer run silently.
+  // of letting the timer run silently. While the element is still loading its
+  // first frame (readyState < HAVE_CURRENT_DATA) we keep waiting — a slow remote
+  // stream must not be misreported as blocked before it has a chance to start.
   useEffect(() => {
     if (!isPlaying) return;
     const interval = setInterval(() => {
+      const audio = audioRef.current;
+      if (audio && audio.readyState < 2) return;
       if (Date.now() - lastProgressAtRef.current > 4000) {
         setBuffering(false);
         setIsPlaying(false);
@@ -675,10 +679,10 @@ export default function App() {
         src={currentTrack?.audioUrl}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
         onTimeUpdate={(event) => { lastProgressAtRef.current = Date.now(); setBuffering(false); setElapsed(event.currentTarget.currentTime); }}
-        onWaiting={() => setBuffering(true)}
-        onStalled={() => setBuffering(true)}
-        onPlaying={() => setBuffering(false)}
-        onCanPlay={() => setBuffering(false)}
+        onWaiting={() => { lastProgressAtRef.current = Date.now(); setBuffering(true); }}
+        onStalled={() => { lastProgressAtRef.current = Date.now(); setBuffering(true); }}
+        onPlaying={() => { lastProgressAtRef.current = Date.now(); setBuffering(false); }}
+        onCanPlay={() => { lastProgressAtRef.current = Date.now(); setBuffering(false); }}
         onError={(event) => {
           setBuffering(false);
           const code = event.currentTarget.error?.code;
