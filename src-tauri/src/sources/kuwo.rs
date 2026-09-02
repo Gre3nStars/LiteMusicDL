@@ -94,57 +94,9 @@ impl KuwoSource {
     }
 
     async fn audio_url(&self, song_id: &str) -> Option<ResolvedAudio> {
-        // Same enabled sequence as musicdl: cgg -> lxmusic -> nxinxz -> haitangw.
-        if let Ok(response) = self
-            .client
-            .get("https://kw-api.cenguigui.cn/")
-            .query(&[
-                ("id", song_id),
-                ("type", "song"),
-                ("level", "lossless"),
-                ("format", "json"),
-            ])
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
-            .send()
-            .await
-        {
-            if let Ok(response) = response.error_for_status() {
-                if let Ok(payload) = response.json::<KuwoAudioEnvelope>().await {
-                    if let Some(url) = payload.data.and_then(|data| data.url).filter(|url| url.starts_with("http")) {
-                        if let Some(audio) = self.resolved_candidate(&url, "无损").await {
-                            return Some(audio);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Ok(response) = self
-            .client
-            .get(format!(
-                "https://lxmusicapi.onrender.com/url/kw/{song_id}/flac"
-            ))
-            .header("Content-Type", "application/json")
-            .header("User-Agent", "lx-music-request/2.6.0")
-            .header("X-Request-Key", "share-v3")
-            .send()
-            .await
-        {
-            if let Ok(response) = response.error_for_status() {
-                if let Ok(payload) = response.json::<Value>().await {
-                    if let Some(url) = payload
-                        .get("url")
-                        .and_then(Value::as_str)
-                        .filter(|url| url.starts_with("http"))
-                    {
-                        if let Some(audio) = self.resolved_candidate(url, "无损").await {
-                            return Some(audio);
-                        }
-                    }
-                }
-            }
-        }
-
+        // Follow musicdl's priority: the reliable l2 parsers (nxinxz / haitangw)
+        // come first. The cgg endpoint has an expired certificate and lxmusic is
+        // rate-limited, so they are kept only as fallbacks.
         for base in [
             "http://music.nxinxz.com/kw.php",
             "https://musicapi.haitangw.net/music/kw.php",
@@ -179,9 +131,58 @@ impl KuwoSource {
             }
         }
 
-        // The original KuwoMusicClient also keeps the NOBB L2 parser after
-        // the cgg/lxmusic/nxinxz/haitangw chain. Do not return an unverified
-        // link before this last source-backed fallback has been attempted.
+        // cgg (currently an expired certificate) — bonus fallback.
+        if let Ok(response) = self
+            .client
+            .get("https://kw-api.cenguigui.cn/")
+            .query(&[
+                ("id", song_id),
+                ("type", "song"),
+                ("level", "lossless"),
+                ("format", "json"),
+            ])
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+            .send()
+            .await
+        {
+            if let Ok(response) = response.error_for_status() {
+                if let Ok(payload) = response.json::<KuwoAudioEnvelope>().await {
+                    if let Some(url) = payload.data.and_then(|data| data.url).filter(|url| url.starts_with("http")) {
+                        if let Some(audio) = self.resolved_candidate(&url, "无损").await {
+                            return Some(audio);
+                        }
+                    }
+                }
+            }
+        }
+
+        // lxmusic (rate-limited) — bonus fallback.
+        if let Ok(response) = self
+            .client
+            .get(format!("https://lxmusicapi.onrender.com/url/kw/{song_id}/flac"))
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "lx-music-request/2.6.0")
+            .header("X-Request-Key", "share-v3")
+            .send()
+            .await
+        {
+            if let Ok(response) = response.error_for_status() {
+                if let Ok(payload) = response.json::<Value>().await {
+                    if let Some(url) = payload
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|url| url.starts_with("http"))
+                    {
+                        if let Some(audio) = self.resolved_candidate(url, "无损").await {
+                            return Some(audio);
+                        }
+                    }
+                }
+            }
+        }
+
+        // The original KuwoMusicClient also keeps the NOBB L2 parser after the
+        // chain. Do not return an unverified link before this last fallback.
         if let Ok(response) = self
             .client
             .get("https://api.nobb.cc/kuwo.music/index.php")
@@ -247,6 +248,12 @@ impl KuwoSource {
             .unwrap_or_default()
             .to_string();
         let song_id = music_rid.trim_start_matches("MUSIC_").to_string();
+        let (quality, format) = song
+            .get("N_MINFO")
+            .or_else(|| song.get("MINFO"))
+            .and_then(Value::as_str)
+            .map(kuwo_quality)
+            .unwrap_or((None, None));
         Some(Track {
             id: format!("kuwo:{song_id}"),
             source: "KuwoMusicClient".into(),
@@ -256,11 +263,53 @@ impl KuwoSource {
             artwork_url: artwork,
             audio_url: String::new(),
             duration_ms: duration.parse::<u64>().unwrap_or_default() * 1000,
-            format: None,
-            quality: None,
+            format,
+            quality,
             adapter_payload: Some(json!({"downloadHeaders": {"User-Agent": KUWO_UA} })),
         })
     }
+}
+
+/// Pick the best available audio quality from Kuwo's `MINFO`/`N_MINFO` string,
+/// e.g. `"level:ff,bitrate:2000,format:flac,...;level:p,bitrate:320,format:mp3,..."`.
+fn kuwo_quality(minfo: &str) -> (Option<String>, Option<String>) {
+    let mut best: Option<(u8, String, String)> = None;
+    for entry in minfo.split(';') {
+        let mut level = "";
+        let mut bitrate = 0u32;
+        let mut format = "";
+        for pair in entry.split(',') {
+            if let Some(value) = pair.strip_prefix("level:") {
+                level = value;
+            } else if let Some(value) = pair.strip_prefix("bitrate:") {
+                bitrate = value.parse().unwrap_or(0);
+            } else if let Some(value) = pair.strip_prefix("format:") {
+                format = value;
+            }
+        }
+        let (rank, quality, fmt) = match level {
+            // The `zply`/`zp*`/`bcms` (mflac / mgg / 臻品母带) tiers are VIP-only,
+            // so dropping them lets the search card report what a guest can play.
+            "ff" => (4, "无损".into(), "flac".into()),
+            "p" => (
+                3,
+                if bitrate >= 320 {
+                    "320K".into()
+                } else {
+                    format!("{bitrate}K")
+                },
+                if format.is_empty() { "mp3".into() } else { format.into() },
+            ),
+            "h" => (2, "128K".into(), "mp3".into()),
+            "s" => (1, "48K".into(), "aac".into()),
+            _ => (0, String::new(), format.into()),
+        };
+        if rank > best.as_ref().map(|entry| entry.0).unwrap_or(0) && !quality.is_empty() {
+            best = Some((rank, quality, fmt));
+        }
+    }
+    best.map(|(_, quality, format)| (Some(quality), Some(format.to_uppercase())))
+        .unwrap_or((None, None))
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,7 +350,7 @@ impl MusicSource for KuwoSource {
         }
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>, String> {
+    async fn search(&self, query: &str, limit: usize, page: u32) -> Result<Vec<Track>, String> {
         let response = self
             .client
             .get("https://www.kuwo.cn/search/searchMusicBykeyWord")
@@ -316,7 +365,7 @@ impl MusicSource for KuwoSource {
                 ("mobi", "1"),
                 ("issubtitle", "1"),
                 ("show_copyright_off", "1"),
-                ("pn", "0"),
+                ("pn", &(page.saturating_sub(1)).to_string()),
                 ("rn", &limit.to_string()),
                 ("all", query),
             ])
@@ -375,6 +424,11 @@ impl MusicSource for KuwoSource {
         resolved.audio_url = resolved_audio.url;
         resolved.format = Some(resolved_audio.extension.to_uppercase());
         resolved.quality = (!resolved_audio.quality.is_empty()).then_some(resolved_audio.quality);
+        if let Some(payload) = resolved.adapter_payload.as_mut() {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("extension".into(), json!(resolved_audio.extension));
+            }
+        }
         Ok(resolved)
     }
 
@@ -414,5 +468,103 @@ impl MusicSource for KuwoSource {
             .collect::<Vec<_>>()
             .join("\n");
         Ok((!lyric.is_empty()).then_some(lyric))
+    }
+
+    async fn resolve_quality(&self, track: &Track) -> Option<(String, String)> {
+        let song_id = track.id.strip_prefix("kuwo:")?;
+        for base in [
+            "http://music.nxinxz.com/kw.php",
+            "https://musicapi.haitangw.net/music/kw.php",
+        ] {
+            for (level, quality) in [
+                ("lossless", "无损"),
+                ("exhigh", "320K"),
+                ("standard", "128K"),
+            ] {
+                let Ok(response) = self
+                    .client
+                    .get(base)
+                    .query(&[("id", song_id), ("level", level), ("type", "json")])
+                    .header("User-Agent", KUWO_UA)
+                    .send()
+                    .await
+                else {
+                    continue;
+                };
+                let Ok(response) = response.error_for_status() else {
+                    continue;
+                };
+                let Ok(value) = response.json::<Value>().await else {
+                    continue;
+                };
+                if let Some(url) = value
+                    .pointer("/data/url")
+                    .and_then(Value::as_str)
+                    .filter(|url| url.starts_with("http"))
+                {
+                    let ext = url
+                        .split('?')
+                        .next()
+                        .and_then(|url| url.rsplit('.').next())
+                        .unwrap_or("mp3")
+                        .to_uppercase();
+                    return Some((quality.to_string(), ext));
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kuwo_quality;
+
+    #[test]
+    fn kuwo_picks_the_best_level() {
+        let minfo = "level:ff,bitrate:2000,format:flac,size:52Mb;level:p,bitrate:320,format:mp3,size:10Mb;level:h,bitrate:128,format:mp3,size:4Mb";
+        let (quality, format) = kuwo_quality(minfo);
+        assert_eq!(quality.as_deref(), Some("无损"));
+        assert_eq!(format.as_deref(), Some("FLAC"));
+
+        let minfo = "level:p,bitrate:320,format:mp3,size:10Mb;level:h,bitrate:128,format:mp3,size:4Mb";
+        let (quality, _) = kuwo_quality(minfo);
+        assert_eq!(quality.as_deref(), Some("320K"));
+
+        // VIP "臻品母带" (zply) is ignored; the playable lossless card wins.
+        let minfo = "level:zply,bitrate:20900,format:mflac,size:178Mb;level:ff,bitrate:2000,format:flac,size:52Mb;level:p,bitrate:320,format:mp3,size:10Mb";
+        let (quality, _) = kuwo_quality(minfo);
+        assert_eq!(quality.as_deref(), Some("无损"));
+
+        assert_eq!(kuwo_quality(""), (None, None));
+    }
+
+    #[test]
+    fn kuwo_search_reports_quality() {
+        let value = serde_json::json!({
+            "MUSICRID": "MUSIC_228908",
+            "SONGNAME": "晴天",
+            "ARTIST": "周杰伦",
+            "ALBUM": "叶惠美",
+            "DURATION": "269",
+            "hts_MVPIC": "https://img2.kuwo.cn/cover.jpg",
+            "MINFO": "level:ff,bitrate:2000,format:flac,size:52.83Mb;level:p,bitrate:320,format:mp3,size:10.29Mb;level:h,bitrate:128,format:mp3,size:4.12Mb"
+        });
+        let track = super::KuwoSource::track_from_value(value).unwrap();
+        assert_eq!(track.quality.as_deref(), Some("无损"));
+        assert_eq!(track.format.as_deref(), Some("FLAC"));
+
+        // A 320K-only card maps to 320K, not a lossless label.
+        let value = serde_json::json!({
+            "MUSICRID": "MUSIC_111",
+            "SONGNAME": "x",
+            "ARTIST": "y",
+            "ALBUM": "z",
+            "DURATION": "100",
+            "hts_MVPIC": "",
+            "MINFO": "level:p,bitrate:320,format:mp3,size:10Mb;level:h,bitrate:128,format:mp3,size:4Mb"
+        });
+        let track = super::KuwoSource::track_from_value(value).unwrap();
+        assert_eq!(track.quality.as_deref(), Some("320K"));
     }
 }

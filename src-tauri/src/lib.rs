@@ -27,6 +27,10 @@ struct PlaybackState {
     next_id: AtomicU64,
 }
 
+struct DownloadState {
+    cancels: Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+}
+
 #[derive(Clone)]
 struct LocalArtwork {
     content_type: String,
@@ -58,17 +62,6 @@ fn media_content_type(track: &Track, headers: &reqwest::header::HeaderMap) -> St
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    match normalized.as_str() {
-        // Kuwo's active fallback returns `audio/x-flac`. WebKit's custom URI
-        // media path recognises the standard form reliably, while it may reject
-        // the legacy x- prefix with MEDIA_ERR_SRC_NOT_SUPPORTED (error 4).
-        "audio/x-flac" | "application/flac" | "application/x-flac" => return "audio/flac".into(),
-        "audio/x-wav" | "audio/wave" => return "audio/wav".into(),
-        "audio/x-m4a" | "audio/mp4" | "video/mp4" => return "audio/mp4".into(),
-        "audio/x-ogg" => return "audio/ogg".into(),
-        _ if normalized.starts_with("audio/") => return normalized,
-        _ => {}
-    }
     let extension = track
         .format
         .as_deref()
@@ -81,16 +74,43 @@ fn media_content_type(track: &Track, headers: &reqwest::header::HeaderMap) -> St
         })
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match extension.as_str() {
-        "flac" => "audio/flac",
-        "m4a" | "mp4" => "audio/mp4",
-        "aac" => "audio/aac",
-        "ogg" | "oga" | "opus" => "audio/ogg",
-        "wav" => "audio/wav",
-        "aif" | "aiff" => "audio/aiff",
-        _ => "audio/mpeg",
+    // The type implied by the resolved container/extension.
+    let type_from_ext = match extension.as_str() {
+        "flac" => Some("audio/flac"),
+        "m4a" | "mp4" => Some("audio/mp4"),
+        "aac" => Some("audio/aac"),
+        "ogg" | "oga" | "opus" => Some("audio/ogg"),
+        "wav" => Some("audio/wav"),
+        "aif" | "aiff" => Some("audio/aiff"),
+        "mp3" | "mpeg" | "mp2" => Some("audio/mpeg"),
+        _ => None,
+    };
+    match normalized.as_str() {
+        // Kuwo's active fallback returns `audio/x-flac`. WebKit's custom URI
+        // media path recognises the standard form reliably, while it may reject
+        // the legacy x- prefix with MEDIA_ERR_SRC_NOT_SUPPORTED (error 4).
+        "audio/x-flac" | "application/flac" | "application/x-flac" => "audio/flac".into(),
+        "audio/x-wav" | "audio/wave" => "audio/wav".into(),
+        "audio/x-m4a" | "audio/mp4" | "video/mp4" => "audio/mp4".into(),
+        // Some sources mislabel the container: QQ tang returns FLAC bytes but
+        // `audio/x-ogg`, and Netease lossless returns FLAC as `audio/mpeg`.
+        // Trust the real container when the header contradicts it.
+        "audio/x-ogg" | "audio/ogg"
+            if type_from_ext.is_some()
+                && !matches!(extension.as_str(), "ogg" | "oga" | "opus") =>
+        {
+            type_from_ext.unwrap().into()
+        }
+        "audio/x-ogg" => "audio/ogg".into(),
+        "audio/mpeg" | "audio/x-mpeg"
+            if type_from_ext.is_some()
+                && !matches!(extension.as_str(), "mp3" | "mpeg" | "mp2") =>
+        {
+            type_from_ext.unwrap().into()
+        }
+        _ if normalized.starts_with("audio/") => normalized,
+        _ => type_from_ext.unwrap_or("audio/mpeg").into(),
     }
-    .into()
 }
 
 fn is_audio_path(path: &std::path::Path) -> bool {
@@ -115,35 +135,97 @@ fn is_audio_path(path: &std::path::Path) -> bool {
     )
 }
 
+/// True when the file's leading bytes look like a real audio container/frame.
+/// Used to reject playlist/lyric/text files that were renamed with an audio
+/// extension and that `lofty` (correctly) refused to parse.
+fn has_audio_magic(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut sample = [0u8; 64];
+    let Ok(read) = file.read(&mut sample) else {
+        return false;
+    };
+    let sample = &sample[..read];
+    if sample.is_empty() {
+        return false;
+    }
+    sample.starts_with(b"ID3")
+        || (sample[0] == 0xff && sample.get(1).is_some_and(|byte| byte & 0xe0 == 0xe0))
+        || sample.starts_with(b"fLaC")
+        || sample.starts_with(b"OggS")
+        || sample.starts_with(b"RIFF")
+        || sample.starts_with(b"FORM")
+        || sample.starts_with(b".snd")
+        || sample.get(4..8) == Some(b"ftyp")
+}
+
+fn is_text_like(bytes: &[u8]) -> bool {
+    // UTF-16 BOM -> almost certainly a text/lyric file.
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+        return true;
+    }
+    // Skip a UTF-8 BOM before the real content sniff.
+    let sample = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        &bytes[3..]
+    } else {
+        bytes
+    };
+    let sample = &sample[..sample.len().min(4_096)];
+    // A lyric/text file begins with a bracket tag such as "[00:01.00]" or
+    // "[ti:...]". Real audio starts with an ID3 frame, a sync word, or a
+    // container magic, so this is a safe discriminator.
+    sample.starts_with(b"[") && sample[..sample.len().min(256)].contains(&b']')
+}
+
 fn is_lyric_file(path: &std::path::Path) -> bool {
-    if path
+    let extension = path
         .extension()
         .and_then(|value| value.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("lrc"))
-    {
+        .map(|value| value.to_ascii_lowercase());
+    // Non-audio companion/playlist/lyric files are never songs.
+    if matches!(
+        extension.as_deref(),
+        Some("lrc" | "txt" | "cue" | "m3u" | "m3u8" | "pls" | "nfo" | "log" | "srt")
+    ) {
         return true;
     }
     let Ok(contents) = std::fs::read(path) else {
         return false;
     };
-    if contents.starts_with(&[0xff, 0xfe]) || contents.starts_with(&[0xfe, 0xff]) {
-        return true;
-    }
-    let contents = &contents[..contents.len().min(4_096)];
     // A number of LRC files use GBK, so checking UTF-8 validity here would
     // incorrectly let a renamed `*.lrc.mp3` text file into the music list.
-    contents.starts_with(b"[") && contents[..contents.len().min(256)].contains(&b']')
+    is_text_like(&contents)
+}
+
+pub(crate) fn sniff_image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
 }
 
 fn local_artwork_from_bytes(content_type: &str, bytes: Vec<u8>) -> Option<LocalArtwork> {
-    if !matches!(
-        content_type,
-        "image/jpeg" | "image/png" | "image/gif" | "image/bmp" | "image/webp"
-    ) || bytes.is_empty()
-        || bytes.len() > 12 * 1024 * 1024
-    {
+    if bytes.is_empty() || bytes.len() > 30 * 1024 * 1024 {
         return None;
     }
+    // Prefer sniffing the real image type; many tag writers store an empty or
+    // non-standard mime (e.g. "image/jpg"), which would otherwise hide covers.
+    let content_type = sniff_image_type(&bytes).or_else(|| match content_type {
+        "image/jpg" => Some("image/jpeg"),
+        "image/jpeg" | "image/png" | "image/gif" | "image/bmp" | "image/webp" => Some(content_type),
+        _ => None,
+    })?;
     Some(LocalArtwork {
         content_type: content_type.into(),
         bytes,
@@ -163,8 +245,12 @@ fn local_artwork(tagged_file: &lofty::file::TaggedFile) -> Option<LocalArtwork> 
                 .flat_map(|tag| tag.pictures())
                 .next()
         })?;
-    let content_type = picture.mime_type()?.as_str();
-    local_artwork_from_bytes(content_type, picture.data().to_vec())
+    // Pass a possibly-empty/odd mime; byte sniffing will recover the type.
+    let content_type = picture
+        .mime_type()
+        .map(|mime| mime.as_str().to_string())
+        .unwrap_or_default();
+    local_artwork_from_bytes(&content_type, picture.data().to_vec())
 }
 
 fn sidecar_artwork(path: &std::path::Path) -> Option<LocalArtwork> {
@@ -259,6 +345,11 @@ fn local_track(path: &std::path::Path) -> Option<(Track, Option<LocalArtwork>)> 
             .as_millis()
             .min(u64::MAX as u128) as u64;
         artwork = local_artwork(&tagged_file);
+    } else if !has_audio_magic(path) {
+        // Not parseable as audio and not a real container: this is a text,
+        // playlist, or lyric file that was renamed with an audio extension.
+        // Never surface it as a song.
+        return None;
     }
     artwork = artwork.or_else(|| sidecar_artwork(path));
     let absolute = path.to_string_lossy().into_owned();
@@ -409,6 +500,7 @@ async fn search_tracks(
     query: String,
     sources: Vec<String>,
     limit: u32,
+    page: u32,
 ) -> Result<Vec<Track>, String> {
     let query = query.trim().to_owned();
     if query.is_empty() {
@@ -427,10 +519,14 @@ async fn search_tracks(
         let query = query.clone();
         async move {
             let descriptor = adapter.descriptor();
-            (
-                descriptor.name,
-                adapter.search(&query, limit.max(1) as usize).await,
-            )
+            let name = descriptor.name;
+            // Transient network errors are common; retry a failed source once
+            // before giving up on it (the result is the retry's outcome).
+            let result = match adapter.search(&query, limit.max(1) as usize, page.max(1)).await {
+                Ok(tracks) => Ok(tracks),
+                Err(_) => adapter.search(&query, limit.max(1) as usize, page.max(1)).await,
+            };
+            (name, result)
         }
     });
     let mut tracks = Vec::new();
@@ -448,6 +544,42 @@ async fn search_tracks(
     }
 }
 
+#[tauri::command]
+async fn resolve_qualities(state: State<'_, AppState>, tracks: Vec<Track>) -> Result<Vec<Track>, String> {
+    // The search card's quality is metadata-only and can over- or under-report
+    // (lossless may be VIP-gated). Resolve each track's *actual* playable tier so
+    // the displayed quality matches what playback will use. Locals pass through
+    // unchanged; failures keep the metadata quality. Processed in small batches to
+    // avoid hammering the sources.
+    let registry = registry(state.client.clone());
+    let mut tracks = tracks;
+    let mut output = Vec::with_capacity(tracks.len());
+    while !tracks.is_empty() {
+        let batch: Vec<_> = tracks.drain(..tracks.len().min(6)).collect();
+        let futures = batch.into_iter().map(|track| {
+            let registry = registry.clone();
+            async move {
+                if local_path(&track).is_some() || !track.audio_url.trim().is_empty() {
+                    return track;
+                }
+                let Some(source) = registry
+                    .iter()
+                    .find(|source| source.descriptor().id == track.source)
+                    .cloned()
+                else {
+                    return track;
+                };
+                match source.resolve_quality(&track).await {
+                    Some((quality, format)) => Track { quality: Some(quality), format: Some(format), ..track },
+                    None => track,
+                }
+            }
+        });
+        output.extend(futures_util::future::join_all(futures).await);
+    }
+    Ok(output)
+}
+
 async fn resolve_track_for_action(client: reqwest::Client, track: Track) -> Result<Track, String> {
     if !track.audio_url.trim().is_empty() || local_path(&track).is_some() {
         return Ok(track);
@@ -456,7 +588,15 @@ async fn resolve_track_for_action(client: reqwest::Client, track: Track) -> Resu
         .into_iter()
         .find(|source| source.descriptor().id == track.source)
         .ok_or_else(|| format!("未找到 {} 的音源适配器", track.source))?;
-    source.resolve_track(&track).await
+    // Retry a transient resolution failure once before surfacing an error to
+    // the user, which smooths over congested-network hiccups.
+    match source.resolve_track(&track).await {
+        Ok(track) => Ok(track),
+        Err(first) => match source.resolve_track(&track).await {
+            Ok(track) => Ok(track),
+            Err(_) => Err(first),
+        },
+    }
 }
 
 #[tauri::command]
@@ -506,8 +646,10 @@ async fn scan_local_music(
 async fn download_track(
     app: AppHandle,
     state: State<'_, AppState>,
+    downloads: State<'_, DownloadState>,
     track: Track,
     directory: Option<String>,
+    id: String,
 ) -> Result<String, String> {
     let track = resolve_track_for_action(state.client.clone(), track).await?;
     let base = match directory.filter(|value| !value.trim().is_empty()) {
@@ -519,7 +661,24 @@ async fn download_track(
             .map(|path| path.join("LiteMusicDL"))
             .map_err(|error| format!("无法确定系统音乐或下载目录: {error}"))?,
     };
-    let path = download::download_track(&state.client, &track, &base).await?;
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    if let Ok(mut map) = downloads.cancels.lock() {
+        if let Some(previous) = map.insert(id.clone(), cancel_tx) {
+            let _ = previous;
+        }
+    }
+    let result = download::download_track(&state.client, &track, &base, cancel_rx).await;
+    if let Ok(mut map) = downloads.cancels.lock() {
+        map.remove(&id);
+    }
+    let path = result?;
+
+    // Write the track's title/artist/album tags and, when available, the album
+    // cover into the downloaded file. Best-effort: a cover or tag failure never
+    // fails an otherwise-successful download.
+    if let Err(error) = download::write_metadata(&state.client, &track, &path).await {
+        eprintln!("LiteMusicDL: 标签/封面写入失败: {error}");
+    }
 
     if let Some(source) = registry(state.client.clone())
         .into_iter()
@@ -530,6 +689,39 @@ async fn download_track(
         }
     }
     Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn cancel_download(downloads: State<'_, DownloadState>, id: String) -> Result<(), String> {
+    let sender = downloads
+        .cancels
+        .lock()
+        .map_err(|_| "下载任务状态不可用".to_string())?
+        .remove(&id);
+    match sender {
+        Some(sender) => {
+            let _ = sender.send(());
+            Ok(())
+        }
+        None => Err("该下载任务已结束或不存在".into()),
+    }
+}
+
+/// Delete a downloaded audio file (and its `.lrc` sidecar) from disk.
+#[tauri::command]
+async fn delete_file(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path.trim());
+    if !path.is_file() {
+        return Err("文件不存在".into());
+    }
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|error| format!("无法删除文件 {}: {error}", path.display()))?;
+    let lyrics = path.with_extension("lrc");
+    if lyrics.is_file() {
+        let _ = tokio::fs::remove_file(&lyrics).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -602,16 +794,22 @@ async fn save_download_history(app: AppHandle, records: Vec<Value>) -> Result<()
 async fn prepare_playback(
     state: State<'_, AppState>,
     playback: State<'_, PlaybackState>,
-    track: Track,
-) -> Result<String, String> {
-    let track = resolve_track_for_action(state.client.clone(), track).await?;
+    mut track: Track,
+) -> Result<Track, String> {
+    // Resolve the real stream (and its source-reported quality/format) before
+    // handing it to the WebView, so the resolved metadata reaches the UI.
+    let resolved = resolve_track_for_action(state.client.clone(), track.clone()).await?;
     let token = playback.next_id.fetch_add(1, Ordering::Relaxed).to_string();
     playback
         .tracks
         .lock()
         .map_err(|_| "播放会话不可用".to_string())?
-        .insert(token.clone(), track);
-    Ok(format!("music://localhost/{token}"))
+        .insert(token.clone(), resolved.clone());
+    // Replace the upstream source URL with the proxied playback URI; the native
+    // `music://` handler still fetches from the stored upstream URL.
+    track = resolved;
+    track.audio_url = format!("music://localhost/{token}");
+    Ok(track)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -628,6 +826,9 @@ pub fn run() {
         .manage(LocalArtworkState {
             artwork: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+        })
+        .manage(DownloadState {
+            cancels: Mutex::new(HashMap::new()),
         })
         .register_asynchronous_uri_scheme_protocol("localart", |context, request, responder| {
             let token = request.uri().path().trim_start_matches('/');
@@ -780,6 +981,27 @@ pub fn run() {
                 };
                 let status = response.status();
                 let headers = response.headers().clone();
+                // A source may answer with a 200 HTML/JSON error page (e.g. a
+                // blocked or expired link). Serving it as audio makes WebKit
+                // "play" silence, so reject it and let the player surface an error.
+                let source_type = headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if source_type.contains("text/html")
+                    || source_type.contains("application/json")
+                    || source_type.contains("application/xml")
+                    || source_type.contains("text/plain")
+                {
+                    responder.respond(
+                        tauri::http::Response::builder()
+                            .status(502)
+                            .body(Vec::new())
+                            .unwrap(),
+                    );
+                    return;
+                }
                 let content_type = media_content_type(&track, &headers);
                 let body = match response.bytes().await {
                     Ok(body) => body.to_vec(),
@@ -807,8 +1029,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sources,
             search_tracks,
+            resolve_qualities,
             scan_local_music,
             download_track,
+            cancel_download,
+            delete_file,
             get_lyrics,
             load_download_history,
             save_download_history,
@@ -820,7 +1045,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_lyric_file, local_lyrics_path};
+    use super::{has_audio_magic, is_lyric_file, local_lyrics_path, local_track, sniff_image_type};
     use std::fs;
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -832,6 +1057,52 @@ mod tests {
         let path = fixture_path("lyrics.mp3");
         fs::write(&path, b"[00:01.00]\xd6\xd0\xce\xc4\xb8\xe8\xb4\xca").unwrap();
         assert!(is_lyric_file(&path));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn excludes_utf8_bom_lrc_and_companion_types() {
+        let path = fixture_path("bom.lrc");
+        fs::write(&path, b"\xef\xbb\xbf[00:01.00]lyric").unwrap();
+        assert!(is_lyric_file(&path));
+        fs::write(&path, b"[00:01.00]x").unwrap();
+        fs::remove_file(path).unwrap();
+
+        for name in ["song.txt", "song.cue", "song.m3u", "song.nfo"] {
+            let candidate = fixture_path(name);
+            fs::write(&candidate, b"anything").unwrap();
+            assert!(is_lyric_file(&candidate), "{name} should be excluded");
+            fs::remove_file(candidate).unwrap();
+        }
+    }
+
+    #[test]
+    fn audio_magic_is_not_lyric() {
+        let path = fixture_path("audio.mp3");
+        fs::write(&path, b"ID3\x04\x00\x00\x00\x00\x00\x00tag").unwrap();
+        assert!(!is_lyric_file(&path));
+        assert!(has_audio_magic(&path));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sniffs_embedded_image_types() {
+        assert_eq!(sniff_image_type(&[0xff, 0xd8, 0xff, 0xdb, 0x00, 0x00]), Some("image/jpeg"));
+        assert_eq!(
+            sniff_image_type(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+            Some("image/png")
+        );
+        assert_eq!(sniff_image_type(&[0x00, 0x01, 0x02]), None);
+    }
+
+    #[test]
+    fn rejects_plain_text_renamed_as_audio() {
+        let path = fixture_path("fake2.mp3");
+        fs::write(&path, b"just a plain text file").unwrap();
+        assert!(!is_lyric_file(&path));
+        assert!(!has_audio_magic(&path));
+        // A file loftily cannot parse and without audio magic must not become a song.
+        assert!(local_track(&path).is_none());
         fs::remove_file(path).unwrap();
     }
 

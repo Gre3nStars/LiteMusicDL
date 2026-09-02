@@ -76,13 +76,13 @@ impl MusicSource for MiguSource {
             enabled: true,
         }
     }
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>, String> {
+    async fn search(&self, query: &str, limit: usize, page: u32) -> Result<Vec<Track>, String> {
         let response = self
             .client
             .get("https://c.musicapp.migu.cn/v1.0/content/search_all.do")
             .query(&[
                 ("text", query),
-                ("pageNo", "1"),
+                ("pageNo", &page.to_string()),
                 ("pageSize", &limit.to_string()),
                 ("isCopyright", "1"),
                 ("sort", "1"),

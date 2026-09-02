@@ -59,13 +59,13 @@ impl QqSource {
         )
     }
 
-    async fn legacy_search(&self, query: &str, limit: usize) -> Result<Vec<Value>, String> {
+    async fn legacy_search(&self, query: &str, limit: usize, page: u32) -> Result<Vec<Value>, String> {
         let response = self
             .client
             .get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp")
             .query(&[
                 ("format", "json"),
-                ("p", "1"),
+                ("p", &page.to_string()),
                 ("n", &limit.to_string()),
                 ("w", query),
             ])
@@ -226,6 +226,7 @@ impl QqSource {
     }
 
     fn track_from_song(song: QqSong) -> Track {
+        let (quality, format) = qq_quality(&song);
         Track {
             id: format!("qq:{}", song.mid),
             source: "QQMusicClient".into(),
@@ -243,12 +244,36 @@ impl QqSource {
             ),
             audio_url: String::new(),
             duration_ms: song.interval * 1000,
-            format: None,
-            quality: None,
+            format,
+            quality,
             adapter_payload: Some(
                 json!({"downloadHeaders": {"Referer": "http://y.qq.com", "User-Agent": QQ_UA}}),
             ),
         }
+    }
+}
+
+/// The quality reported by the search card, aligned with what `resolve_stream`
+/// actually chooses (lossless first). Reads BOTH the mobile `file.size_*` object
+/// and the legacy flat `size128/size320/sizeflac/sizeape/sizeogg` fields, so
+/// quality shows even when the mobile API returns empty and we fall back to
+/// `client_search_cp`. Dolby / Hi-Res are never resolve targets.
+fn qq_quality(song: &QqSong) -> (Option<String>, Option<String>) {
+    let f = &song.file;
+    if f.size_flac > 0 || f.size_ape > 0 || song.sizeflac > 0 || song.sizeape > 0 {
+        (Some("无损".into()), Some("FLAC".into()))
+    } else if f.size_320mp3 > 0 || song.size320 > 0 || song.sizeogg > 0 {
+        (Some("320K".into()), Some("MP3".into()))
+    } else if f.size_192aac > 0 || f.size_192ogg > 0 {
+        (Some("192K".into()), Some("MP3".into()))
+    } else if f.size_128mp3 > 0 || song.size128 > 0 {
+        (Some("128K".into()), Some("MP3".into()))
+    } else if f.size_96aac > 0 || f.size_96ogg > 0 {
+        (Some("96K".into()), Some("MP3".into()))
+    } else if f.size_24aac > 0 {
+        (Some("48K".into()), Some("AAC".into()))
+    } else {
+        (None, None)
     }
 }
 
@@ -264,6 +289,46 @@ struct QqSong {
     album: QqAlbum,
     #[serde(default, alias = "interval")]
     interval: u64,
+    #[serde(default)]
+    file: QqFile,
+    // Legacy `client_search_cp` items expose quality as flat size fields.
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size128: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size320: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    sizeape: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    sizeflac: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    sizeogg: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+struct QqFile {
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_128mp3: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_192aac: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_192ogg: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_96aac: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_96ogg: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_24aac: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_320mp3: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_ape: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_dolby: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_flac: u64,
+    #[serde(default, deserialize_with = "crate::domain::de_u64_loose")]
+    size_hires: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -327,12 +392,12 @@ impl MusicSource for QqSource {
         }
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>, String> {
+    async fn search(&self, query: &str, limit: usize, page: u32) -> Result<Vec<Track>, String> {
         let payload = json!({
             "comm": Self::common(),
             "music.search.SearchCgiService.DoSearchForQQMusicMobile": {
                 "module": "music.search.SearchCgiService", "method": "DoSearchForQQMusicMobile",
-                "param": {"searchid": Self::guid(), "query": query, "search_type": 0, "num_per_page": limit, "page_num": 1, "highlight": 1, "grp": 1}
+                "param": {"searchid": Self::guid(), "query": query, "search_type": 0, "num_per_page": limit, "page_num": page, "highlight": 1, "grp": 1}
             }
         });
         let response = self
@@ -357,7 +422,7 @@ impl MusicSource for QqSource {
             .cloned()
             .unwrap_or_default();
         let songs = if songs.is_empty() {
-            self.legacy_search(query, limit).await?
+            self.legacy_search(query, limit, page).await?
         } else {
             songs
         };
@@ -385,6 +450,11 @@ impl MusicSource for QqSource {
         resolved.audio_url = audio_url;
         resolved.format = Some(extension.to_uppercase());
         resolved.quality = (!quality.is_empty()).then_some(quality);
+        if let Some(payload) = resolved.adapter_payload.as_mut() {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("extension".into(), json!(extension));
+            }
+        }
         Ok(resolved)
     }
 
@@ -394,5 +464,95 @@ impl MusicSource for QqSource {
             .strip_prefix("qq:")
             .ok_or_else(|| "歌曲标识不属于 QQ 音乐".to_string())?;
         Ok(self.query_lyric(song_mid).await)
+    }
+
+    async fn resolve_quality(&self, track: &Track) -> Option<(String, String)> {
+        let song_mid = track.id.strip_prefix("qq:")?;
+        // The VKey path returns empty for guests, so the tang `_parsewithtangapi`
+        // decides the tier; its highest available one is what playback resolves.
+        let (_, quality, extension) = self.resolve_tang(song_mid).await;
+        if quality.is_empty() {
+            return None;
+        }
+        Some((quality, extension.to_uppercase()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{qq_quality, QqAlbum, QqFile, QqSong};
+
+    fn song(file: QqFile) -> QqSong {
+        QqSong {
+            mid: "m".into(),
+            title: "t".into(),
+            singer: vec![],
+            album: QqAlbum::default(),
+            interval: 0,
+            file,
+            size128: 0,
+            size320: 0,
+            sizeape: 0,
+            sizeflac: 0,
+            sizeogg: 0,
+        }
+    }
+
+    // Legacy `client_search_cp` items carry flat size fields instead of `file`.
+    fn legacy(size128: u64, size320: u64, sizeflac: u64, sizeogg: u64) -> QqSong {
+        QqSong {
+            size128,
+            size320,
+            sizeflac,
+            sizeogg,
+            ..song(QqFile::default())
+        }
+    }
+
+    #[test]
+    fn qq_prefers_lossless_then_standard() {
+        // A lossless-capable card plays as 无损 (resolve tries lossless first).
+        let s = song(QqFile { size_flac: 100, size_320mp3: 99, ..Default::default() });
+        assert_eq!(qq_quality(&s), (Some("无损".into()), Some("FLAC".into())));
+
+        let s = song(QqFile { size_320mp3: 100, size_128mp3: 99, ..Default::default() });
+        assert_eq!(qq_quality(&s), (Some("320K".into()), Some("MP3".into())));
+
+        let s = song(QqFile { size_128mp3: 100, size_dolby: 100, ..Default::default() });
+        assert_eq!(qq_quality(&s), (Some("128K".into()), Some("MP3".into())));
+
+        // Only VIP Dolby present and no standard tier -> nothing to report.
+        let s = song(QqFile { size_dolby: 100, ..Default::default() });
+        assert_eq!(qq_quality(&s), (None, None));
+
+        assert_eq!(qq_quality(&song(QqFile::default())), (None, None));
+    }
+
+    #[test]
+    fn qq_legacy_fields_report_quality() {
+        // Legacy cards have no `file`; quality comes from flat size fields.
+        let s = legacy(4_288_455, 10_720_847, 31_386_542, 6_600_445);
+        assert_eq!(qq_quality(&s), (Some("无损".into()), Some("FLAC".into())));
+
+        let s = legacy(4_288_455, 10_720_847, 0, 0);
+        assert_eq!(qq_quality(&s), (Some("320K".into()), Some("MP3".into())));
+
+        let s = legacy(4_288_455, 0, 0, 0);
+        assert_eq!(qq_quality(&s), (Some("128K".into()), Some("MP3".into())));
+    }
+
+    #[test]
+    fn qq_deserializes_real_file_sizes() {
+        let song: QqSong = serde_json::from_value(serde_json::json!({
+            "mid": "003Qui1q2u1Zho",
+            "title": "晴天",
+            "singer": [{"name": "周杰伦"}],
+            "album": {"mid": "000MkMni19ClKG", "title": "叶惠美"},
+            "interval": 269,
+            "file": {"size_128mp3": 4317292, "size_320mp3": 10792943, "size_flac": 55397039, "size_dolby": 0}
+        }))
+        .unwrap();
+        assert_eq!(song.file.size_flac, 55_397_039);
+        assert_eq!(qq_quality(&song), (Some("无损".into()), Some("FLAC".into())));
     }
 }
