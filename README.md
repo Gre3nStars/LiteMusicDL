@@ -24,6 +24,17 @@ LiteMusicDL 是一个使用 React、TypeScript、Rust 与 Tauri 2 完全重写�
 
 这些音源均来自原 musicdl 项目的适配范围。项目不会使用演示歌曲或伪造歌词填充界面。
 
+## 界面
+<img width="3596" height="2102" alt="image" src="https://github.com/user-attachments/assets/51a3ad80-52f7-4dea-8e08-94829c917994" />
+
+<img width="3600" height="2102" alt="image" src="https://github.com/user-attachments/assets/6710c8a1-4daf-499a-989c-089cedec6a7c" />
+
+<img width="3600" height="2102" alt="image" src="https://github.com/user-attachments/assets/e531ff71-21c5-44ca-92a1-60f1b557e7c5" />
+
+<img width="3600" height="2102" alt="image" src="https://github.com/user-attachments/assets/7565bf79-4841-41a7-987d-7081f89727e0" />
+
+
+
 ## 开发
 
 需要 Node.js、pnpm、Rust 和 Tauri 2 的系统依赖。
