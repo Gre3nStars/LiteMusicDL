@@ -52,8 +52,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: 20
 
       - name: Enable pnpm (corepack)
         # corepack ships with Node, so pnpm is always available once the
@@ -62,6 +61,15 @@ jobs:
         run: |
           corepack enable
           pnpm --version
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -113,8 +121,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: 20
 
       - name: Enable pnpm (corepack)
         # corepack ships with Node, so pnpm is always available once the
@@ -123,6 +130,15 @@ jobs:
         run: |
           corepack enable
           pnpm --version
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
