@@ -52,13 +52,16 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
+      - name: Enable pnpm (corepack)
+        # corepack ships with Node, so pnpm is always available once the
+        # `packageManager` field pins the version. This is far more reliable on
+        # GitHub runners than the standalone pnpm/action-setup PATH injection.
+        run: |
+          corepack enable
+          pnpm --version
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -110,13 +113,16 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
+      - name: Enable pnpm (corepack)
+        # corepack ships with Node, so pnpm is always available once the
+        # `packageManager` field pins the version. This is far more reliable on
+        # GitHub runners than the standalone pnpm/action-setup PATH injection.
+        run: |
+          corepack enable
+          pnpm --version
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -131,7 +137,10 @@ jobs:
           key: tauri-win-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install NSIS (makensis)
-        run: choco install nsis --yes --no-progress
+        run: |
+          choco install nsis --yes --no-progress
+          echo "$env:ProgramFiles(x86)\NSIS" >> "$env:GITHUB_PATH"
+          Get-Command makensis -ErrorAction SilentlyContinue
 
       - name: Install frontend dependencies
         run: pnpm install --no-frozen-lockfile
